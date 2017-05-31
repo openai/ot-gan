@@ -31,8 +31,6 @@ parser.add_argument('--matching_batch_size', type=int, default=125, help='batch 
 args = parser.parse_args()
 print(args)
 
-t0 = time.time()
-
 # extract model settings
 model_opts = {'batch_size': args.batch_size, 'layers_per_block': args.layers_per_block,
               'filters_per_layer': args.filters_per_layer, 'nonlinearity': args.nonlinearity}
@@ -184,10 +182,9 @@ try:
 except:
     os.mkdir(args.save_dir)
 print('starting training')
-print(time.time() - t0)
 gen_counter = 0
 with tf.Session() as sess:
-    for epoch in range(2): #1000000
+    for epoch in range(1000000):
         begin = time.time()
 
         # randomly permute

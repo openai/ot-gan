@@ -1,3 +1,5 @@
+""" simplified, more efficient, but slightly wrong, version of the original (two-batch) training code """
+
 import argparse
 import time
 import os
@@ -25,8 +27,6 @@ parser.add_argument('--nr_gen_per_disc', type=int, default=10, help='How many ti
 parser.add_argument('--sinkhorn_lambda', type=float, default=30.)
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=1000)
 args = parser.parse_args()
-assert args.nr_gpu % 2 == 0
-half_ngpu = args.nr_gpu // 2
 print(args)
 
 # extract model settings
@@ -71,36 +71,25 @@ for i in range(args.nr_gpu):
             features_dat.append(discriminator(x_data[i], **model_opts))
             features_dat[i] /= tf.sqrt(tf.reduce_sum(tf.square(features_dat[i]), axis=1, keep_dims=True))
 
-# gather all features, split into two batches
-with tf.control_dependencies(features_dat): # prevent TF from trying to do this simultaneously and running out of memory
-    fg_batch1 = tf.concat(features_gen[:half_ngpu],axis=0)
-    fg_batch2 = tf.concat(features_gen[half_ngpu:],axis=0)
-    fd_batch1 = tf.concat(features_dat[:half_ngpu],axis=0)
-    fd_batch2 = tf.concat(features_dat[half_ngpu:],axis=0)
+# gather all features
+with tf.control_dependencies(features_dat):  # prevent TF from trying to do this simultaneously and running out of memory
+    fg_all = tf.concat(features_gen,axis=0)
+    fd_all = tf.concat(features_dat,axis=0)
 
 # calculate all distances
-dist_gen1_gen2 = []
-dist_dat2_dat1 = []
-dist_gen1_dat1 = []
-dist_gen1_dat2 = []
-dist_gen2_dat1 = []
-dist_gen2_dat2 = []
-
-for i in range(half_ngpu):
+dist_gen_gen = []
+dist_dat_dat = []
+dist_gen_dat = []
+for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
-        dist_gen1_gen2.append(1. - tf.matmul(features_gen[i],fg_batch2,transpose_b=True))
-        dist_gen1_dat1.append(1. - tf.matmul(features_gen[i],fd_batch1,transpose_b=True))
-        dist_gen1_dat2.append(1. - tf.matmul(features_gen[i],fd_batch2,transpose_b=True))
+        dist_gen_gen.append(1. - tf.matmul(features_gen[i],fg_all,transpose_b=True))
+        dist_dat_dat.append(1. - tf.matmul(features_dat[i],fd_all,transpose_b=True))
+        dist_gen_dat.append(1. - tf.matmul(features_gen[i],fd_all,transpose_b=True))
 
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        dist_gen2_dat1.append(1. - tf.matmul(features_gen[i],fd_batch1,transpose_b=True))
-        dist_gen2_dat2.append(1. - tf.matmul(features_gen[i],fd_batch2,transpose_b=True))
-        dist_dat2_dat1.append(1. - tf.matmul(features_dat[i],fd_batch1,transpose_b=True))
-
-distances = [tf.concat(dist_gen1_gen2,0), tf.concat(dist_dat2_dat1,0),
-             tf.concat(dist_gen1_dat1,0), tf.concat(dist_gen1_dat2,0),
-             tf.concat(dist_gen2_dat1,0), tf.concat(dist_gen2_dat2,0)]
+# combine results + add a bit to the diagonal to prevent self-matches
+distances = [tf.concat(dist_gen_gen,0) + 999.*tf.eye(args.nr_gpu * args.batch_size),
+             tf.concat(dist_dat_dat,0) + 999.*tf.eye(args.nr_gpu * args.batch_size),
+             tf.concat(dist_gen_dat,0)]
 
 # use Sinkhorn algorithm to do soft assignment
 assignments = []
@@ -114,81 +103,42 @@ for i in range(len(distances)):
 
         assignments.append(tf.nn.softmax(log_a))
 
-assignment_gen1_gen2, assignment_dat2_dat1, assignment_gen1_dat1, assignment_gen1_dat2, \
-    assignment_gen2_dat1, assignment_gen2_dat2 = assignments
+assignment_gen_gen, assignment_dat_dat, assignment_gen_dat = assignments
 
 # get matched features
-features_gen1_gen2_matched = tf.split(tf.matmul(assignment_gen1_gen2, fg_batch2), half_ngpu, 0)
-features_dat1_dat2_matched = tf.split(tf.matmul(assignment_dat2_dat1, fd_batch2, transpose_a=True), half_ngpu, 0)
-features_gen1_dat1_matched = tf.split(tf.matmul(assignment_gen1_dat1, fd_batch1), half_ngpu, 0)
-features_gen1_dat2_matched = tf.split(tf.matmul(assignment_gen1_dat2, fd_batch2), half_ngpu, 0)
-features_gen2_dat1_matched = tf.split(tf.matmul(assignment_gen2_dat1, fd_batch1), half_ngpu, 0)
-features_gen2_dat2_matched = tf.split(tf.matmul(assignment_gen2_dat2, fd_batch2), half_ngpu, 0)
-features_gen2_gen1_matched = tf.split(tf.matmul(assignment_gen1_gen2, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat2_dat1_matched = tf.split(tf.matmul(assignment_dat2_dat1, fd_batch1), half_ngpu, 0)
-features_dat1_gen1_matched = tf.split(tf.matmul(assignment_gen1_dat1, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat2_gen1_matched = tf.split(tf.matmul(assignment_gen1_dat2, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat1_gen2_matched = tf.split(tf.matmul(assignment_gen2_dat1, fg_batch2, transpose_a=True), half_ngpu, 0)
-features_dat2_gen2_matched = tf.split(tf.matmul(assignment_gen2_dat2, fg_batch2, transpose_a=True), half_ngpu, 0)
+features_gen_gen_matched = tf.split(tf.matmul(assignment_gen_gen, fg_all), args.nr_gpu, 0)
+features_dat_dat_matched = tf.split(tf.matmul(assignment_dat_dat, fd_all), args.nr_gpu, 0)
+features_gen_dat_matched = tf.split(tf.matmul(assignment_gen_dat, fd_all), args.nr_gpu, 0)
+features_dat_gen_matched = tf.split(tf.matmul(assignment_gen_dat, fg_all, transpose_a=True), args.nr_gpu, 0)
 
 # get distances
 dist = []
-for i in range(half_ngpu):
+for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
-        nd_gen_gen = tf.reduce_sum(features_gen[i] * features_gen1_gen2_matched[i])
-        nd_dat_dat = tf.reduce_sum(features_dat[i] * features_dat1_dat2_matched[i])
-        nd_gen_dat1 = tf.reduce_sum(features_gen[i] * features_gen1_dat1_matched[i])
-        nd_gen_dat2 = tf.reduce_sum(features_gen[i] * features_gen1_dat2_matched[i])
-        dist.append(nd_dat_dat + nd_gen_gen - nd_gen_dat1 - nd_gen_dat2)
-
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        nd_gen_gen = tf.reduce_sum(features_gen[i] * features_gen2_gen1_matched[i-half_ngpu])
-        nd_dat_dat = tf.reduce_sum(features_dat[i] * features_dat2_dat1_matched[i-half_ngpu])
-        nd_gen_dat1 = tf.reduce_sum(features_gen[i] * features_gen2_dat1_matched[i-half_ngpu])
-        nd_gen_dat2 = tf.reduce_sum(features_gen[i] * features_gen2_dat2_matched[i-half_ngpu])
-        dist.append(nd_dat_dat + nd_gen_gen - nd_gen_dat1 - nd_gen_dat2)
-
+        nd_gen_gen = tf.reduce_sum(features_gen[i] * features_gen_gen_matched[i])
+        nd_dat_dat = tf.reduce_sum(features_dat[i] * features_dat_dat_matched[i])
+        nd_gen_dat = tf.reduce_sum(features_gen[i] * features_gen_dat_matched[i])
+        dist.append(nd_dat_dat + nd_gen_gen - 2. * nd_gen_dat)
 total_dist = sum(dist)/(2*args.batch_size*args.nr_gpu)
 
 # get gradients
 grads_gen = []
 grads_disc = []
-for i in range(half_ngpu):
+for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
-        grad_features_gen_i = features_gen1_gen2_matched[i] - 0.5*(features_gen1_dat1_matched[i]+features_gen1_dat2_matched[i])
-        grad_features_dat_i = features_dat1_dat2_matched[i] - 0.5*(features_dat1_gen1_matched[i]+features_dat1_gen2_matched[i])
+        grad_features_gen_i = features_gen_gen_matched[i] - features_gen_dat_matched[i]
+        grad_features_dat_i = features_dat_dat_matched[i] - features_dat_gen_matched[i]
 
-        with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
+        with tf.control_dependencies([total_dist]): # prevent TF from trying to do this simultaneously and running out of memory
             grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
 
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
+        with tf.control_dependencies(grad_disc_i): # prevent TF from trying to do this simultaneously and running out of memory
+            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params+[x_gens[i]], grad_ys=grad_features_gen_i)
 
         for j in range(len(grad_disc_i)):
             grad_disc_i[j] += grad_disc_and_sample_i[j]
 
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
-
-        grads_disc.append(grad_disc_i)
-        grads_gen.append(grad_gen_i)
-
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        grad_features_gen_i = features_gen2_gen1_matched[i-half_ngpu] - 0.5 * (features_gen2_dat1_matched[i-half_ngpu] + features_gen2_dat2_matched[i-half_ngpu])
-        grad_features_dat_i = features_dat2_dat1_matched[i-half_ngpu] - 0.5 * (features_dat2_gen1_matched[i-half_ngpu] + features_dat2_gen2_matched[i-half_ngpu])
-
-        with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
-
-        for j in range(len(grad_disc_i)):
-            grad_disc_i[j] += grad_disc_and_sample_i[j]
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
+        with tf.control_dependencies(grad_disc_i): # prevent TF from trying to do this simultaneously and running out of memory
             grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
 
         grads_disc.append(grad_disc_i)

@@ -13,7 +13,7 @@ from data import cifar10_data
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
 parser.add_argument('--batch_size', type=int, default=500)
-parser.add_argument('--learning_rate_disc', type=float, default=0.0001)
+parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
 parser.add_argument('--save_dir', type=str, default='/local_home/tim/med_gan')
@@ -81,7 +81,7 @@ with tf.control_dependencies(features_dat): # prevent TF from trying to do this 
 
 # calculate all distances
 dist_gen1_gen2 = []
-dist_dat1_dat2 = []
+dist_dat2_dat1 = []
 dist_gen1_dat1 = []
 dist_gen1_dat2 = []
 dist_gen2_dat1 = []
@@ -97,18 +97,18 @@ for i in range(half_ngpu,args.nr_gpu):
     with tf.device('/gpu:%d' % i):
         dist_gen2_dat1.append(1. - tf.matmul(features_gen[i],fd_batch1,transpose_b=True))
         dist_gen2_dat2.append(1. - tf.matmul(features_gen[i],fd_batch2,transpose_b=True))
-        dist_dat1_dat2.append(1. - tf.matmul(features_dat[i],fd_batch1,transpose_b=True))
+        dist_dat2_dat1.append(1. - tf.matmul(features_dat[i],fd_batch1,transpose_b=True))
 
-distances = [tf.concat(dist_gen1_gen2,0), tf.concat(dist_dat1_dat2,0),
+distances = [tf.concat(dist_gen1_gen2,0), tf.concat(dist_dat2_dat1,0),
              tf.concat(dist_gen1_dat1,0), tf.concat(dist_gen1_dat2,0),
              tf.concat(dist_gen2_dat1,0), tf.concat(dist_gen2_dat2,0)]
 
 # use CPU/python to do assignment between samples
-assignment_gen1_gen2, assignment_dat1_dat2, assignment_gen1_dat1, assignment_gen1_dat2, assignment_gen2_dat1, assignment_gen2_dat2 \
+assignment_gen1_gen2, assignment_dat2_dat1, assignment_gen1_dat1, assignment_gen1_dat2, assignment_gen2_dat1, assignment_gen2_dat2 \
     = [tf_match(d, args.nr_matching_reps, args.matching_batch_size) for d in distances]
 
 assignment_gen2_gen1 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_gen1_gen2)
-assignment_dat2_dat1 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_dat1_dat2)
+assignment_dat1_dat2 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_dat2_dat1)
 assignment_dat1_gen1 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_gen1_dat1)
 assignment_dat2_gen1 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_gen1_dat2)
 assignment_dat1_gen2 = tf.gather(tf.range(half_ngpu*args.batch_size, dtype=tf.int32), assignment_gen2_dat1)

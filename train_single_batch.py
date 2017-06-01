@@ -182,7 +182,7 @@ try:
 except:
     os.mkdir(args.save_dir)
 print('starting training')
-gen_counter = 0
+step_counter = 0
 with tf.Session() as sess:
     for epoch in range(1000000):
         begin = time.time()
@@ -204,14 +204,15 @@ with tf.Session() as sess:
                 feed_dict[x_data[i]] = maybe_flip(trainx[td * args.batch_size:(td + 1) * args.batch_size])
 
             # train discriminator once every args.nr_gen_per_disc batches
-            if gen_counter % args.nr_gen_per_disc == 0:
+            if step_counter % (args.nr_gen_per_disc+1) == 0:
                 feed_dict.update({tf_lr: args.learning_rate_disc})
                 npd, _ = sess.run([total_dist, disc_optimizer], feed_dict=feed_dict)
+                step_counter += 1
 
             else: # train generator
                 feed_dict.update({tf_lr: args.learning_rate_gen})
                 npd, _ = sess.run([total_dist, gen_optimizer], feed_dict=feed_dict)
-                gen_counter += 1
+                step_counter += 1
 
             np_distances.append(npd)
 

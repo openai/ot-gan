@@ -5,7 +5,6 @@ import numpy as np
 import tensorflow as tf
 from utils import nn
 from utils import plotting
-from utils.memory_saving_gradients import gradients
 from hungarian.parallel_matching import tf_match
 from models.densenet import generator, discriminator
 from data import cifar10_data
@@ -21,7 +20,7 @@ parser.add_argument('--save_dir', type=str, default='/local_home/tim/med_gan')
 parser.add_argument('--optimizer', type=str, default='adamax')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
 parser.add_argument('--layers_per_block', type=int, default=8)
-parser.add_argument('--filters_per_layer', type=int, default=32)
+parser.add_argument('--filters_per_layer', type=int, default=24)
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 parser.add_argument('--nr_gen_per_disc', type=int, default=10, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--nr_matching_reps', type=int, default=100, help='how many iterations to spend on optimizing the matching')
@@ -102,7 +101,7 @@ for i in range(half_ngpu,args.nr_gpu):
 
 distances = [tf.concat(dist_gen1_gen2,0), tf.concat(dist_dat1_dat2,0),
              tf.concat(dist_gen1_dat1,0), tf.concat(dist_gen1_dat2,0),
-             tf.concat(dist_gen2_dat1, 0), tf.concat(dist_gen2_dat2, 0)]
+             tf.concat(dist_gen2_dat1,0), tf.concat(dist_gen2_dat2,0)]
 
 # use CPU/python to do assignment between samples
 assignment_gen1_gen2, assignment_dat1_dat2, assignment_gen1_dat1, assignment_gen1_dat2, assignment_gen2_dat1, assignment_gen2_dat2 \
@@ -147,7 +146,7 @@ for i in range(half_ngpu,args.nr_gpu):
         nd_gen_dat2 = tf.reduce_sum(features_gen[i] * features_gen2_dat2_matched[i-half_ngpu])
         dist.append(nd_dat_dat + nd_gen_gen - nd_gen_dat1 - nd_gen_dat2)
 
-total_dist = sum(dist)/(args.batch_size*args.nr_gpu)
+total_dist = sum(dist)/(2*args.batch_size*args.nr_gpu)
 
 # get gradients
 grads_gen = []
@@ -158,16 +157,16 @@ for i in range(half_ngpu):
         grad_features_dat_i = features_dat1_dat2_matched[i] - 0.5*(features_dat1_gen1_matched[i]+features_dat1_gen2_matched[i])
 
         with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_i = gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
+            grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
 
         with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
+            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
 
         for j in range(len(grad_disc_i)):
             grad_disc_i[j] += grad_disc_and_sample_i[j]
 
         with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_gen_i = gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
+            grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
 
         grads_disc.append(grad_disc_i)
         grads_gen.append(grad_gen_i)
@@ -178,16 +177,16 @@ for i in range(half_ngpu,args.nr_gpu):
         grad_features_dat_i = features_dat2_dat1_matched[i-half_ngpu] - 0.5 * (features_dat2_gen1_matched[i-half_ngpu] + features_dat2_gen2_matched[i-half_ngpu])
 
         with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_i = gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
+            grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
 
         with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
+            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
 
         for j in range(len(grad_disc_i)):
             grad_disc_i[j] += grad_disc_and_sample_i[j]
 
         with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_gen_i = gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
+            grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
 
         grads_disc.append(grad_disc_i)
         grads_gen.append(grad_gen_i)

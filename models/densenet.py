@@ -25,12 +25,10 @@ def disc_spec(x, init=False, layers_per_block=16, filters_per_layer=16, nonlinea
         x = block(x)
 
         x = downsample(x)
-        tf.add_to_collection('remember', x)
 
         x = block(x)
 
         x = downsample(x)
-        tf.add_to_collection('remember', x)
 
         x = block(x)
 
@@ -60,23 +58,23 @@ def gen_spec(batch_size, init=False, layers_per_block=16, filters_per_layer=16, 
             return x
 
         def upsample(x):
-            if type(x) is list:
-                x = tf.concat(x,3)
-            xs = nn.int_shape(x)
-            x = tf.image.resize_nearest_neighbor(x, [2*xs[1], 2*xs[2]])
-            num_filters = xs[-1] // 2
-            return nn.conv2d(x, num_filters, pre_activation=nonlinearity)
+            if type(x) is not list:
+                x = [x]
+            k = np.sum([xi.get_shape().as_list()[-1] for xi in x])//2
+            x = [nn.conv2d(x, k, pre_activation=nonlinearity)]
+            for rep in range(3):
+                x.append(nn.conv2d(x, k, pre_activation=nonlinearity))
+            x = tf.depth_to_space(tf.concat(x,3), 2)
+            return x
 
         x = nn.dense(u[0], 8*8*filters_per_layer, pre_activation=None)
         x = [tf.reshape(x, shape=(batch_size,8,8,filters_per_layer)), u[1]]
 
         x = block(x)
         x = upsample(x)
-        tf.add_to_collection('remember', x)
         x = [x, u[2]]
         x = block(x)
         x = upsample(x)
-        tf.add_to_collection('remember', x)
         x = [x, u[3]]
         x = block(x)
 

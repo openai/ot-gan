@@ -5,33 +5,39 @@ import numpy as np
 import tensorflow as tf
 from utils import nn
 from utils import plotting
-from models.densenet import generator, discriminator
+from utils import matching
 from data import cifar10_data
 
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
 parser.add_argument('--batch_size', type=int, default=500)
-parser.add_argument('--learning_rate_disc', type=float, default=0.0001)
+parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
 parser.add_argument('--save_dir', type=str, default='/local_home/tim/med_gan')
 parser.add_argument('--optimizer', type=str, default='adamax')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
-parser.add_argument('--layers_per_block', type=int, default=8)
-parser.add_argument('--filters_per_layer', type=int, default=48)
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
-parser.add_argument('--nr_gen_per_disc', type=int, default=10, help='How many times to update the generator for each update of the discriminator?')
-parser.add_argument('--sinkhorn_lambda', type=float, default=30.)
+parser.add_argument('--nr_gen_per_disc', type=int, default=5, help='How many times to update the generator for each update of the discriminator?')
+parser.add_argument('--sinkhorn_lambda', type=float, default=500.)
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=1000)
+parser.add_argument('--single_batch', dest='single_batch', action='store_true', help='Use simplified batching using a single batch instead of 2')
+parser.add_argument('--train_disc_against_ema', dest='train_disc_against_ema', action='store_true', help='Should discriminator be trained against samples of EMA generator?')
+parser.add_argument('--model', type=str, default='dcgan')
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
 half_ngpu = args.nr_gpu // 2
 print(args)
 
+if args.model == 'dcgan':
+    from models.dcgan import generator, discriminator
+elif args.model == 'densenet':
+    from models.densenet import generator, discriminator
+
+
 # extract model settings
-model_opts = {'batch_size': args.batch_size, 'layers_per_block': args.layers_per_block,
-              'filters_per_layer': args.filters_per_layer, 'nonlinearity': args.nonlinearity}
+model_opts = {'batch_size': args.batch_size, 'nonlinearity': args.nonlinearity}
 
 # fix random seed
 np.random.seed(args.seed)
@@ -49,150 +55,70 @@ all_params = tf.trainable_variables()
 saver = tf.train.Saver(all_params)
 disc_params = [p for p in all_params if 'discriminator' in p.name]
 gen_params = [p for p in all_params if 'generator' in p.name]
+ema = tf.train.ExponentialMovingAverage(decay=0.99)
+maintain_averages_op = ema.apply(gen_params)
 
 # data placeholders
 x_data = [tf.placeholder(tf.float32, shape=(args.batch_size, 32, 32, 3)) for i in range(args.nr_gpu)]
 
 # generate samples
 x_gens = []
+x_gens_ema = []
 for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
         x_gens.append(generator(**model_opts))
+        x_gens_ema.append(generator(ema=ema, **model_opts))
 
 # feature extraction
 features_dat = []
 features_gen = []
+features_gen_ema = []
 for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
+        features_dat.append(discriminator(x_data[i], **model_opts))
         features_gen.append(discriminator(x_gens[i], **model_opts))
-        features_gen[i] /= tf.sqrt(tf.reduce_sum(tf.square(features_gen[i]), axis=1, keep_dims=True))
+        features_gen_ema.append(discriminator(x_gens_ema[i], **model_opts))
 
-        with tf.control_dependencies([features_gen[i]]):  # prevent TF from trying to do this simultaneously and running out of memory
-            features_dat.append(discriminator(x_data[i], **model_opts))
-            features_dat[i] /= tf.sqrt(tf.reduce_sum(tf.square(features_dat[i]), axis=1, keep_dims=True))
-
-# gather all features, split into two batches
-with tf.control_dependencies(features_dat): # prevent TF from trying to do this simultaneously and running out of memory
-    fg_batch1 = tf.concat(features_gen[:half_ngpu],axis=0)
-    fg_batch2 = tf.concat(features_gen[half_ngpu:],axis=0)
-    fd_batch1 = tf.concat(features_dat[:half_ngpu],axis=0)
-    fd_batch2 = tf.concat(features_dat[half_ngpu:],axis=0)
-
-# calculate all distances
-dist_gen1_gen2 = []
-dist_dat2_dat1 = []
-dist_gen1_dat1 = []
-dist_gen1_dat2 = []
-dist_gen2_dat1 = []
-dist_gen2_dat2 = []
-
-for i in range(half_ngpu):
-    with tf.device('/gpu:%d' % i):
-        dist_gen1_gen2.append(1. - tf.matmul(features_gen[i],fg_batch2,transpose_b=True))
-        dist_gen1_dat1.append(1. - tf.matmul(features_gen[i],fd_batch1,transpose_b=True))
-        dist_gen1_dat2.append(1. - tf.matmul(features_gen[i],fd_batch2,transpose_b=True))
-
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        dist_gen2_dat1.append(1. - tf.matmul(features_gen[i],fd_batch1,transpose_b=True))
-        dist_gen2_dat2.append(1. - tf.matmul(features_gen[i],fd_batch2,transpose_b=True))
-        dist_dat2_dat1.append(1. - tf.matmul(features_dat[i],fd_batch1,transpose_b=True))
-
-distances = [tf.concat(dist_gen1_gen2,0), tf.concat(dist_dat2_dat1,0),
-             tf.concat(dist_gen1_dat1,0), tf.concat(dist_gen1_dat2,0),
-             tf.concat(dist_gen2_dat1,0), tf.concat(dist_gen2_dat2,0)]
-
-# use Sinkhorn algorithm to do soft assignment
-assignments = []
-for i in range(len(distances)):
-    with tf.device('/gpu:%d' % (i%args.nr_gpu)):
-        log_a = -args.sinkhorn_lambda * distances[i]
-
-        for it in range(args.nr_sinkhorn_iter):
-            log_a -= tf.reduce_logsumexp(log_a, axis=1, keep_dims=True)
-            log_a -= tf.reduce_logsumexp(log_a, axis=0, keep_dims=True)
-
-        assignments.append(tf.nn.softmax(log_a))
-
-assignment_gen1_gen2, assignment_dat2_dat1, assignment_gen1_dat1, assignment_gen1_dat2, \
-    assignment_gen2_dat1, assignment_gen2_dat2 = assignments
-
-# get matched features
-features_gen1_gen2_matched = tf.split(tf.matmul(assignment_gen1_gen2, fg_batch2), half_ngpu, 0)
-features_dat1_dat2_matched = tf.split(tf.matmul(assignment_dat2_dat1, fd_batch2, transpose_a=True), half_ngpu, 0)
-features_gen1_dat1_matched = tf.split(tf.matmul(assignment_gen1_dat1, fd_batch1), half_ngpu, 0)
-features_gen1_dat2_matched = tf.split(tf.matmul(assignment_gen1_dat2, fd_batch2), half_ngpu, 0)
-features_gen2_dat1_matched = tf.split(tf.matmul(assignment_gen2_dat1, fd_batch1), half_ngpu, 0)
-features_gen2_dat2_matched = tf.split(tf.matmul(assignment_gen2_dat2, fd_batch2), half_ngpu, 0)
-features_gen2_gen1_matched = tf.split(tf.matmul(assignment_gen1_gen2, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat2_dat1_matched = tf.split(tf.matmul(assignment_dat2_dat1, fd_batch1), half_ngpu, 0)
-features_dat1_gen1_matched = tf.split(tf.matmul(assignment_gen1_dat1, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat2_gen1_matched = tf.split(tf.matmul(assignment_gen1_dat2, fg_batch1, transpose_a=True), half_ngpu, 0)
-features_dat1_gen2_matched = tf.split(tf.matmul(assignment_gen2_dat1, fg_batch2, transpose_a=True), half_ngpu, 0)
-features_dat2_gen2_matched = tf.split(tf.matmul(assignment_gen2_dat2, fg_batch2, transpose_a=True), half_ngpu, 0)
+# match samples and get features
+if args.single_batch:
+    features_matched = matching.get_matched_features_single_batch(features_gen, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
+    features_matched_ema = matching.get_matched_features_single_batch(features_gen_ema, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
+else:
+    features_matched = matching.get_matched_features(features_gen, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
+    features_matched_ema = matching.get_matched_features(features_gen_ema, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
+avg_entropy = features_matched[-1]
 
 # get distances
-dist = []
-for i in range(half_ngpu):
-    with tf.device('/gpu:%d' % i):
-        nd_gen_gen = tf.reduce_sum(features_gen[i] * features_gen1_gen2_matched[i])
-        nd_dat_dat = tf.reduce_sum(features_dat[i] * features_dat1_dat2_matched[i])
-        nd_gen_dat1 = tf.reduce_sum(features_gen[i] * features_gen1_dat1_matched[i])
-        nd_gen_dat2 = tf.reduce_sum(features_gen[i] * features_gen1_dat2_matched[i])
-        dist.append(nd_dat_dat + nd_gen_gen - nd_gen_dat1 - nd_gen_dat2)
+total_dist_gen = matching.calc_distance(features_gen, features_dat, features_matched)
+if args.train_disc_against_ema:
+    total_dist_disc = matching.calc_distance(features_gen_ema, features_dat, features_matched_ema)
+else:
+    total_dist_disc = total_dist_gen
 
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        nd_gen_gen = tf.reduce_sum(features_gen[i] * features_gen2_gen1_matched[i-half_ngpu])
-        nd_dat_dat = tf.reduce_sum(features_dat[i] * features_dat2_dat1_matched[i-half_ngpu])
-        nd_gen_dat1 = tf.reduce_sum(features_gen[i] * features_gen2_dat1_matched[i-half_ngpu])
-        nd_gen_dat2 = tf.reduce_sum(features_gen[i] * features_gen2_dat2_matched[i-half_ngpu])
-        dist.append(nd_dat_dat + nd_gen_gen - nd_gen_dat1 - nd_gen_dat2)
-
-total_dist = sum(dist)/(2*args.batch_size*args.nr_gpu)
-
-# get gradients
+# get gradients for generator
 grads_gen = []
+for i in range(args.nr_gpu):
+    with tf.device('/gpu:%d' % i):
+        grad_features_gen_i = features_matched[0][i] - features_matched[2][i]
+        grad_gen_i = tf.gradients(ys=features_gen[i], xs=gen_params, grad_ys=grad_features_gen_i)
+        grads_gen.append(grad_gen_i)
+
+# get gradients for discriminator (potentially uses EMA samples!)
 grads_disc = []
-for i in range(half_ngpu):
+for i in range(args.nr_gpu):
     with tf.device('/gpu:%d' % i):
-        grad_features_gen_i = features_gen1_gen2_matched[i] - 0.5*(features_gen1_dat1_matched[i]+features_gen1_dat2_matched[i])
-        grad_features_dat_i = features_dat1_dat2_matched[i] - 0.5*(features_dat1_gen1_matched[i]+features_dat1_gen2_matched[i])
-
-        with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
-
-        for j in range(len(grad_disc_i)):
-            grad_disc_i[j] += grad_disc_and_sample_i[j]
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
+        if args.train_disc_against_ema:
+            grad_features_gen_i = features_matched_ema[0][i] - features_matched_ema[2][i]
+            grad_features_dat_i = features_matched_ema[1][i] - features_matched_ema[3][i]
+            grad_disc_i = tf.gradients(ys=[features_dat[i], features_gen_ema[i]], xs=disc_params,
+                                       grad_ys=[grad_features_dat_i, grad_features_gen_i])
+        else:
+            grad_features_gen_i = features_matched[0][i] - features_matched[2][i]
+            grad_features_dat_i = features_matched[1][i] - features_matched[3][i]
+            grad_disc_i = tf.gradients(ys=[features_dat[i], features_gen[i]], xs=disc_params,
+                                       grad_ys=[grad_features_dat_i, grad_features_gen_i])
 
         grads_disc.append(grad_disc_i)
-        grads_gen.append(grad_gen_i)
-
-for i in range(half_ngpu,args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        grad_features_gen_i = features_gen2_gen1_matched[i-half_ngpu] - 0.5 * (features_gen2_dat1_matched[i-half_ngpu] + features_gen2_dat2_matched[i-half_ngpu])
-        grad_features_dat_i = features_dat2_dat1_matched[i-half_ngpu] - 0.5 * (features_dat2_gen1_matched[i-half_ngpu] + features_dat2_gen2_matched[i-half_ngpu])
-
-        with tf.control_dependencies([total_dist]):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_i = tf.gradients(ys=features_dat[i], xs=disc_params, grad_ys=grad_features_dat_i)
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_disc_and_sample_i = tf.gradients(ys=features_gen[i], xs=disc_params + [x_gens[i]], grad_ys=grad_features_gen_i)
-
-        for j in range(len(grad_disc_i)):
-            grad_disc_i[j] += grad_disc_and_sample_i[j]
-
-        with tf.control_dependencies(grad_disc_i):  # prevent TF from trying to do this simultaneously and running out of memory
-            grad_gen_i = tf.gradients(ys=x_gens[i], xs=gen_params, grad_ys=grad_disc_and_sample_i[-1])
-
-        grads_disc.append(grad_disc_i)
-        grads_gen.append(grad_gen_i)
 
 # add gradients together and get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
@@ -205,10 +131,10 @@ with tf.device('/gpu:0'):
 
     if args.optimizer == 'adam':
         gen_optimizer = nn.adam_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.99)
-        disc_optimizer = nn.adam_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.95)
+        disc_optimizer = nn.adam_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.99)
     elif args.optimizer == 'adamax':
         gen_optimizer = nn.adamax_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.99)
-        disc_optimizer = nn.adamax_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.95)
+        disc_optimizer = nn.adamax_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.99)
     elif args.optimizer == 'nesterov':
         gen_optimizer = nn.nesterov_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5)
         disc_optimizer = nn.nesterov_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5)
@@ -239,6 +165,8 @@ except:
     os.mkdir(args.save_dir)
 print('starting training')
 step_counter = 0
+mean_dist_gen = []
+mean_dist_disc = []
 with tf.Session() as sess:
     for epoch in range(1000000):
         begin = time.time()
@@ -252,7 +180,9 @@ with tf.Session() as sess:
             sess.run(initializer, feed_dict={x_init: trainx[:args.batch_size]})
 
         # train
-        np_distances = []
+        np_distances_gen = []
+        np_distances_disc = []
+        np_entropy = []
         for t in range(nr_batches_train_per_gpu):
             feed_dict = {}
             for i in range(args.nr_gpu):
@@ -262,18 +192,22 @@ with tf.Session() as sess:
             # train discriminator once every args.nr_gen_per_disc batches
             if step_counter % (args.nr_gen_per_disc+1) == 0:
                 feed_dict.update({tf_lr: args.learning_rate_disc})
-                npd, _ = sess.run([total_dist, disc_optimizer], feed_dict=feed_dict)
+                npd_ema, e, _ = sess.run([total_dist_disc, avg_entropy, disc_optimizer], feed_dict=feed_dict)
                 step_counter += 1
+                np_distances_disc.append(npd_ema)
+                np_entropy.append(e)
 
             else: # train generator
                 feed_dict.update({tf_lr: args.learning_rate_gen})
-                npd, _ = sess.run([total_dist, gen_optimizer], feed_dict=feed_dict)
+                npd, e, _, _ = sess.run([total_dist_gen, avg_entropy, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
                 step_counter += 1
-
-            np_distances.append(npd)
+                np_distances_gen.append(npd)
+            np_entropy.append(e)
 
         # log
-        print("Iteration %d, time = %ds, train distance = %.6f" % (epoch, time.time()-begin, np.mean(np_distances)))
+        mean_dist_gen.append(np.mean(np_distances_gen))
+        mean_dist_disc.append(np.mean(np_distances_disc))
+        print("Iteration %d, time = %ds, train distance before gen = %.6f, train distance before disc = %.6f, avg matching entropy = %.6f" % (epoch, time.time()-begin, mean_dist_gen[-1], mean_dist_disc[-1], np.mean(np_entropy)))
 
         # save generated image
         sample_x = sess.run(x_gens)
@@ -283,6 +217,15 @@ with tf.Session() as sess:
         plotting.plt.savefig(os.path.join(args.save_dir, 'sample%d.png' % epoch))
         plotting.plt.close('all')
 
-        # save parameters
+        # save EMA generated image
+        sample_x = sess.run(x_gens_ema)
+        sample_x = np.concatenate(sample_x)
+        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
+        img = plotting.plot_img(img_tile, title='CIFAR10 samples')
+        plotting.plt.savefig(os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
+        plotting.plt.close('all')
+
+        # save parameters + historical distances
         if epoch+1 % 50 == 0:
             saver.save(sess, os.path.join(args.save_dir, 'med_gan_params'), global_step=epoch)
+            np.savez(os.path.join(args.save_dir, 'distances.npz'), mean_dist_gen=np.array(mean_dist_gen), mean_dist_disc=np.array(mean_dist_disc))

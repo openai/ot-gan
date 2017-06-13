@@ -6,6 +6,7 @@ import tensorflow as tf
 from utils import nn
 from utils import plotting
 from utils import matching
+from utils.inception import get_inception_score
 from data import cifar10_data
 
 # settings
@@ -19,12 +20,13 @@ parser.add_argument('--save_dir', type=str, default='/local_home/tim/med_gan')
 parser.add_argument('--optimizer', type=str, default='adamax')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
-parser.add_argument('--nr_gen_per_disc', type=int, default=5, help='How many times to update the generator for each update of the discriminator?')
+parser.add_argument('--nr_gen_per_disc', type=int, default=10, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--sinkhorn_lambda', type=float, default=500.)
-parser.add_argument('--nr_sinkhorn_iter', type=int, default=1000)
+parser.add_argument('--nr_sinkhorn_iter', type=int, default=500)
 parser.add_argument('--single_batch', dest='single_batch', action='store_true', help='Use simplified batching using a single batch instead of 2')
 parser.add_argument('--train_disc_against_ema', dest='train_disc_against_ema', action='store_true', help='Should discriminator be trained against samples of EMA generator?')
 parser.add_argument('--model', type=str, default='dcgan')
+parser.add_argument('--load_params', dest='load_params', action='store_true')
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
 half_ngpu = args.nr_gpu // 2
@@ -44,7 +46,7 @@ np.random.seed(args.seed)
 tf.set_random_seed(args.seed)
 
 # run once for data dependent initialization of parameters
-x_init = tf.placeholder(tf.float32, shape=(args.batch_size, 32, 32, 3))
+x_init = tf.placeholder(tf.float32, shape=(None, 32, 32, 3))
 f = discriminator(x_init, init=True, **model_opts)
 generator(init=True, **model_opts)
 num_features = f.get_shape().as_list()[-1]
@@ -59,7 +61,7 @@ ema = tf.train.ExponentialMovingAverage(decay=0.99)
 maintain_averages_op = ema.apply(gen_params)
 
 # data placeholders
-x_data = [tf.placeholder(tf.float32, shape=(args.batch_size, 32, 32, 3)) for i in range(args.nr_gpu)]
+x_data = [tf.placeholder(tf.float32, shape=(None, 32, 32, 3)) for i in range(args.nr_gpu)]
 
 # generate samples
 x_gens = []
@@ -144,10 +146,12 @@ with tf.device('/gpu:0'):
 # init
 initializer = tf.global_variables_initializer()
 
-# load CIFAR-10 training data
+# load CIFAR-10 data
 trainx, trainy = cifar10_data.load(args.data_dir + '/cifar-10-python')
 trainx = np.transpose(trainx, (0,2,3,1))/127.5 - 1.
-nr_batches_train_per_gpu = int(trainx.shape[0]/(args.nr_gpu*args.batch_size))
+nr_batches_train_per_gpu = trainx.shape[0]//(args.nr_gpu*args.batch_size)
+testx, testy = cifar10_data.load(args.data_dir + '/cifar-10-python', subset='test')
+testx = np.transpose(testx, (0,2,3,1))/127.5 - 1.
 
 def maybe_flip(x):
     x_out = np.zeros_like(x)
@@ -174,10 +178,13 @@ with tf.Session() as sess:
         # randomly permute
         inds = np.random.permutation(trainx.shape[0])
         trainx = trainx[inds]
+        trainy = trainy[inds] # only used for testing unsupervised features every 50 epochs
 
         # init
         if epoch==0:
             sess.run(initializer, feed_dict={x_init: trainx[:args.batch_size]})
+            if args.load_params:
+                saver.restore(sess, os.path.join(args.save_dir, 'med_gan_params'))
 
         # train
         np_distances_gen = []
@@ -218,14 +225,48 @@ with tf.Session() as sess:
         plotting.plt.close('all')
 
         # save EMA generated image
-        sample_x = sess.run(x_gens_ema)
-        sample_x = np.concatenate(sample_x)
-        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
+        sample_x_ema = sess.run(x_gens_ema)
+        sample_x_ema = np.concatenate(sample_x_ema)
+        img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
         img = plotting.plot_img(img_tile, title='CIFAR10 samples')
         plotting.plt.savefig(os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
         plotting.plt.close('all')
 
-        # save parameters + historical distances
-        if epoch+1 % 50 == 0:
+        if (epoch+1) % 50 == 0:
+            # save parameters + historical distances
             saver.save(sess, os.path.join(args.save_dir, 'med_gan_params'), global_step=epoch)
             np.savez(os.path.join(args.save_dir, 'distances.npz'), mean_dist_gen=np.array(mean_dist_gen), mean_dist_disc=np.array(mean_dist_disc))
+
+            # calculate inception score
+            sample_x = [127.5*(sample_x[i]+1.) for i in range(sample_x.shape[0])]
+            sample_x_ema = [127.5 * (sample_x_ema[i] + 1.) for i in range(sample_x_ema.shape[0])]
+            inception_score = get_inception_score(sample_x, splits=1)
+            print('inception score was %.6f' % inception_score[0])
+            inception_score = get_inception_score(sample_x_ema, splits=1)
+            print('EMA inception score was %.6f' % inception_score[0])
+
+            # /////// test unsupervised classification performance /////////
+
+            # randomly select 1000 labeled training images
+            x_labeled = []
+            for label in range(10):
+                x_labeled.append(trainx[trainy==label][:100])
+            feed_dict = {xph: xd for xph, xd in zip(x_data, np.split(np.concatenate(x_labeled), args.nr_gpu, 0))}
+            x_labeled_features = np.split(np.concatenate(sess.run(features_dat, feed_dict=feed_dict)), 10, 0)
+
+            # get test features
+            test_features = np.zeros((testx.shape[0], num_features), dtype=np.float32)  # pretty big!
+            for t in range(int(np.ceil(testx.shape[0] / (args.nr_gpu * args.batch_size)))):
+                end_ind = np.minimum((t + 1) * args.nr_gpu * args.batch_size, testx.shape[0])
+                start_ind = end_ind - args.nr_gpu * args.batch_size
+                feed_dict = {xph: xd for xph, xd in zip(x_data, np.split(testx[start_ind:end_ind], args.nr_gpu, 0))}
+                test_features[start_ind:end_ind] = np.concatenate(sess.run(features_dat, feed_dict=feed_dict))
+
+            # first nearest neighbor classification
+            distances = []
+            for label in range(10):
+                distances.append(np.amin(1. - np.matmul(test_features, x_labeled_features[label].T), axis=1, keepdims=True))
+            pred_label = np.argmin(np.concatenate(distances,1),1)
+
+            print("unsupervised prediction error was %.2f percent" % (100. * (1. - np.mean((pred_label.astype(np.int64)==testy.astype(np.int64)).astype(np.float64)))))
+

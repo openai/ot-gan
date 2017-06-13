@@ -37,7 +37,7 @@ def disc_spec(x, init=False, layers_per_block=16, filters_per_layer=16, nonlinea
         x = tf.concat(x,3)
         x = tf.concat([tf.nn.relu(x), tf.nn.relu(-x)],3)
         xs = x.get_shape().as_list()
-        x = tf.reshape(x, [xs[0], np.prod(xs[1:])])
+        x = tf.reshape(x, [-1, np.prod(xs[1:])])
 
         x /= tf.sqrt(tf.reduce_sum(tf.square(x), axis=1, keep_dims=True))
 

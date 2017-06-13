@@ -17,7 +17,7 @@ def energy_distance(f_sample, f_data):
     return loss,grads
 
 def int_shape(x):
-    return [int(s) if s is not None else None for s in x.get_shape()]
+    return x.get_shape().as_list() #[int(s) if s is not None else None for s in x.get_shape()]
 
 def weight_decay(params):
     loss = 0.

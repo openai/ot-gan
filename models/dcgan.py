@@ -15,7 +15,7 @@ def disc_spec(x, init=False, nonlinearity='crelu', ema=None, **kwargs):
 
         x = tf.concat([tf.nn.relu(x), tf.nn.relu(-x)],3)
         xs = x.get_shape().as_list()
-        x = tf.reshape(x, [xs[0], np.prod(xs[1:])])
+        x = tf.reshape(x, [-1, np.prod(xs[1:])])
         x /= tf.sqrt(tf.reduce_sum(tf.square(x), axis=1, keep_dims=True))
 
         # return the features

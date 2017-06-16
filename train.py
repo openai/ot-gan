@@ -270,3 +270,13 @@ with tf.Session() as sess:
 
             print("unsupervised prediction error was %.2f percent" % (100. * (1. - np.mean((pred_label.astype(np.int64)==testy.astype(np.int64)).astype(np.float64)))))
 
+            # can also try comparing to average representation instead
+            x_labeled_features = [np.mean(f,axis=0) for f in x_labeled_features]
+            distances = []
+            for label in range(10):
+                distances.append(1. - np.matmul(test_features, x_labeled_features[label]))
+            pred_label = np.argmin(np.stack(distances, 1), 1)
+
+            print("unsupervised prediction error using 2nd method was %.2f percent" % (
+            100. * (1. - np.mean((pred_label.astype(np.int64) == testy.astype(np.int64)).astype(np.float64)))))
+

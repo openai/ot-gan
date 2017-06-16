@@ -12,7 +12,7 @@ from data import cifar10_data
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=500)
+parser.add_argument('--batch_size', type=int, default=625)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')

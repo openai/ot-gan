@@ -31,14 +31,22 @@ def gen_spec(batch_size, init=False, nonlinearity='crelu', ema=None, **kwargs):
 
     with arg_scope([nn.conv2d, nn.dense], counters={}, init=init, weight_norm=True, ema=ema):
 
-        x = nn.dense(u, 4*4*1024, pre_activation=None)
+        x = nn.dense(u, 2*4*4*1024, pre_activation=None)
+        x,l = tf.split(x,2,1)
+        x *= tf.nn.sigmoid(l) # gated linear unit, one of Alec's tricks
         x = tf.reshape(x, shape=(batch_size,4,4,1024))
         x = tf.image.resize_nearest_neighbor(x, [8,8])
-        x = nn.conv2d(x, 512, filter_size=[5,5], pre_activation=nonlinearity)
+        x = nn.conv2d(x, 2*512, filter_size=[5,5], pre_activation=None)
+        x, l = tf.split(x, 2, 3)
+        x *= tf.nn.sigmoid(l)
         x = tf.image.resize_nearest_neighbor(x, [16,16])
-        x = nn.conv2d(x, 256, filter_size=[5,5], pre_activation=nonlinearity)
+        x = nn.conv2d(x, 2*256, filter_size=[5,5], pre_activation=None)
+        x, l = tf.split(x, 2, 3)
+        x *= tf.nn.sigmoid(l)
         x = tf.image.resize_nearest_neighbor(x, [32, 32])
-        x = nn.conv2d(x, 128, filter_size=[5, 5], pre_activation=nonlinearity)
+        x = nn.conv2d(x, 2*128, filter_size=[5, 5], pre_activation=None)
+        x, l = tf.split(x, 2, 3)
+        x *= tf.nn.sigmoid(l)
         x = tf.nn.tanh(nn.conv2d(x, 3, filter_size=[5,5], pre_activation=nonlinearity, init_scale=0.1))
 
         return x

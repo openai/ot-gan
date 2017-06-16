@@ -17,10 +17,10 @@ parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
 parser.add_argument('--save_dir', type=str, default='/local_home/tim/med_gan')
-parser.add_argument('--optimizer', type=str, default='adamax')
+parser.add_argument('--optimizer', type=str, default='adam')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
-parser.add_argument('--nr_gen_per_disc', type=int, default=10, help='How many times to update the generator for each update of the discriminator?')
+parser.add_argument('--nr_gen_per_disc', type=int, default=5, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--sinkhorn_lambda', type=float, default=500.)
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=500)
 parser.add_argument('--single_batch', dest='single_batch', action='store_true', help='Use simplified batching using a single batch instead of 2')
@@ -57,7 +57,7 @@ all_params = tf.trainable_variables()
 saver = tf.train.Saver(all_params)
 disc_params = [p for p in all_params if 'discriminator' in p.name]
 gen_params = [p for p in all_params if 'generator' in p.name]
-ema = tf.train.ExponentialMovingAverage(decay=0.99)
+ema = tf.train.ExponentialMovingAverage(decay=0.999)
 maintain_averages_op = ema.apply(gen_params)
 
 # data placeholders
@@ -132,11 +132,11 @@ with tf.device('/gpu:0'):
             grads_disc[0][j] += grads_disc[i][j]
 
     if args.optimizer == 'adam':
-        gen_optimizer = nn.adam_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.99)
-        disc_optimizer = nn.adam_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.99)
+        gen_optimizer = nn.adam_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.999)
+        disc_optimizer = nn.adam_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.999)
     elif args.optimizer == 'adamax':
-        gen_optimizer = nn.adamax_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.99)
-        disc_optimizer = nn.adamax_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.99)
+        gen_optimizer = nn.adamax_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5, mom2=0.999)
+        disc_optimizer = nn.adamax_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5, mom2=0.999)
     elif args.optimizer == 'nesterov':
         gen_optimizer = nn.nesterov_updates(gen_params, grads_gen[0], lr=tf_lr, mom1=0.5)
         disc_optimizer = nn.nesterov_updates(disc_params, grads_disc[0], lr=-tf_lr, mom1=0.5)

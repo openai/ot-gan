@@ -47,7 +47,7 @@ def gen_spec(batch_size, init=False, nonlinearity='crelu', ema=None, **kwargs):
         x = nn.conv2d(x, 2*128, filter_size=[5, 5], pre_activation=None)
         x, l = tf.split(x, 2, 3)
         x *= tf.nn.sigmoid(l)
-        x = tf.nn.tanh(nn.conv2d(x, 3, filter_size=[5,5], pre_activation=nonlinearity, init_scale=0.1))
+        x = tf.nn.tanh(nn.conv2d(x, 3, filter_size=[5,5], pre_activation=None, init_scale=0.1))
 
         return x
 

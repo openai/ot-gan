@@ -1,9 +1,17 @@
 import numpy as np
 import matplotlib
+from PIL import Image
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
 # Plot image examples.
+
+def save_tile_img(imgs, path):
+    imgs = (imgs + 1.0) * 127.5
+    imgs = imgs.astype(np.uint8)
+    im = Image.fromarray(imgs)
+    im.save(path)
+
 def plot_img(img, title=None):
     plt.figure()
     plt.imshow(img, interpolation='nearest')

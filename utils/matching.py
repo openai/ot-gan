@@ -1,5 +1,13 @@
 import tensorflow as tf
 
+def get_matched_features_random(features_a, features_b):
+    features_a_a = features_a[1:] + features_a[:1]
+    features_b_b = features_b[1:] + features_b[:1]
+    features_a_b = features_b
+    features_b_a = features_a
+
+    return features_a_a, features_b_b, features_a_b, features_b_a, tf.zeros(shape=[], dtype=tf.float32, name=None)
+
 def get_matched_features(features_a, features_b, sinkhorn_lambda, nr_sinkhorn_iter):
     ngpu = len(features_a)
     half_ngpu = ngpu // 2
@@ -23,7 +31,7 @@ def get_matched_features(features_a, features_b, sinkhorn_lambda, nr_sinkhorn_it
             dist_a1_a2.append(1. - tf.matmul(features_a[i],fa_batch2,transpose_b=True))
             dist_a1_b1.append(1. - tf.matmul(features_a[i],fb_batch1,transpose_b=True))
             dist_a1_b2.append(1. - tf.matmul(features_a[i],fb_batch2,transpose_b=True))
-    
+
     for i in range(half_ngpu,2*half_ngpu):
         with tf.device('/gpu:%d' % i):
             dist_a2_b1.append(1. - tf.matmul(features_a[i],fb_batch1,transpose_b=True))

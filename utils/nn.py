@@ -126,9 +126,9 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
                     V = tf.get_variable('V', [nr_in, num_units], tf.float32,
                                     tf.random_normal_initializer(0, 0.05), trainable=True)
                 if weight_norm:
-                    W = tf.nn.l2_normalize(V.initialized_value(), [i for i in np.arange(len(V.get_shape())-1)])
+                    W = tf.nn.l2_normalize(V, [i for i in np.arange(len(V.get_shape())-1)])
                 else:
-                    W = V.initialized_value()
+                    W = V
 
             # moments for normalization
             if use_W:
@@ -140,7 +140,8 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
             # scale
             init_g = init_scale / tf.sqrt(v_init)
             if use_g:
-                g = tf.get_variable('g', dtype=tf.float32, initializer=init_g, trainable=True).initialized_value()
+                g = tf.get_variable('g', dtype=tf.float32, shape=num_units, initializer=tf.ones_initializer(), trainable=True)
+                g = g.assign(init_g)
                 if use_W:
                     W *= tf.reshape(g, [1]*(len(W.get_shape())-1)+[num_units])
                 else: # g is used directly if there are no weights
@@ -156,7 +157,8 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
 
             # bias
             if use_b:
-                b = tf.get_variable('b', dtype=tf.float32, initializer=-m_init, trainable=True).initialized_value()
+                b = tf.get_variable('b', dtype=tf.float32, shape=num_units, initializer=tf.zeros_initializer(), trainable=True)
+                b = b.assign(-m_init)
                 params['b'] = b
 
         else:
@@ -219,7 +221,7 @@ def _dense(x, W, pre_activation=None, mem_funcs=mem_funcs):
         my_func = mem_funcs[func_name]
     else:
         my_grad = lambda op,grad: __dense_grad(op, grad, pre_activation)
-        @tff.Defun(tf.float32, tf.float32, func_name=func_name, python_grad_func=my_grad)
+        #@tff.Defun(tf.float32, tf.float32, func_name=func_name, python_grad_func=my_grad)
         def my_func(W,x):
             return __dense(W, pre_activation, x)
         mem_funcs[func_name] = my_func
@@ -260,7 +262,7 @@ def _conv2d(x, W, stride=[1,1], pad='SAME', dilate=1, pre_activation=None, upsam
         my_func = mem_funcs[func_name]
     else:
         my_grad = lambda op, grad: __list_conv2d_grad(op, grad, stride, pad, dilate, pre_activation, upsample, xs)
-        @tff.Defun(*([tf.float32] * (len(x) + 1)), func_name=func_name, python_grad_func=my_grad)
+        #@tff.Defun(*([tf.float32] * (len(x) + 1)), func_name=func_name, python_grad_func=my_grad)
         def my_func(W, *x_list):
             return __list_conv2d(W, stride, pad, dilate, pre_activation, upsample, xs, *x_list)
         mem_funcs[func_name] = my_func
@@ -294,7 +296,7 @@ def global_avg_pool(x, pre_activation='celu', mem_funcs=mem_funcs):
         my_func = mem_funcs[func_name]
     else:
         my_grad = lambda op, grad: __list_global_avg_pool_grad(op, grad, pre_activation)
-        @tff.Defun(*([tf.float32] * len(x)), func_name=func_name, python_grad_func=my_grad)
+        #@tff.Defun(*([tf.float32] * len(x)), func_name=func_name, python_grad_func=my_grad)
         def my_func(*x_list):
             return __list_global_avg_pool(pre_activation, *x_list)
         mem_funcs[func_name] = my_func

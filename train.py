@@ -27,6 +27,7 @@ parser.add_argument('--single_batch', dest='single_batch', action='store_true', 
 parser.add_argument('--train_disc_against_ema', dest='train_disc_against_ema', action='store_true', help='Should discriminator be trained against samples of EMA generator?')
 parser.add_argument('--model', type=str, default='dcgan')
 parser.add_argument('--load_params', dest='load_params', action='store_true')
+parser.add_argument('--no_sinkhorn', dest='no_sinkhorn', action='store_true')
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
 half_ngpu = args.nr_gpu // 2
@@ -85,6 +86,10 @@ for i in range(args.nr_gpu):
 if args.single_batch:
     features_matched = matching.get_matched_features_single_batch(features_gen, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
     features_matched_ema = matching.get_matched_features_single_batch(features_gen_ema, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
+elif args.no_sinkhorn:
+    print('using random image matching')
+    features_matched = matching.get_matched_features_random(features_gen, features_dat)
+    features_matched_ema = matching.get_matched_features_random(features_gen_ema, features_dat)
 else:
     features_matched = matching.get_matched_features(features_gen, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)
     features_matched_ema = matching.get_matched_features(features_gen_ema, features_dat, args.sinkhorn_lambda, args.nr_sinkhorn_iter)

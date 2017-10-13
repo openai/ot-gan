@@ -8,6 +8,7 @@ from utils import plotting
 from utils import matching
 from utils.inception import get_inception_score
 from data import cifar10_data
+import sys
 
 # settings
 parser = argparse.ArgumentParser()
@@ -27,6 +28,7 @@ parser.add_argument('--single_batch', dest='single_batch', action='store_true', 
 parser.add_argument('--train_disc_against_ema', dest='train_disc_against_ema', action='store_true', help='Should discriminator be trained against samples of EMA generator?')
 parser.add_argument('--model', type=str, default='dcgan')
 parser.add_argument('--load_params', dest='load_params', action='store_true')
+parser.add_argument('--model_name', type=str, default='med_gan_params-2399')
 parser.add_argument('--no_sinkhorn', dest='no_sinkhorn', action='store_true')
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
@@ -176,20 +178,27 @@ print('starting training')
 step_counter = 0
 mean_dist_gen = []
 mean_dist_disc = []
+
+dis_updates = 0
+test_batches_per_gpu = 50000 // (args.nr_gpu*args.batch_size) + 1
+max_inception_score = 0
+max_iter = 0
+current_epoch = 0
+
 with tf.Session() as sess:
-    for epoch in range(1000000):
+    sess.run(initializer, feed_dict={x_init: trainx[:args.batch_size]})
+    if args.load_params:
+        saver.restore(sess, os.path.join(args.save_dir, args.model_name))
+        ix = args.model_name.rfind('-')
+        current_epoch = int(args.model_name[ix + 1:])
+
+    start_time = time.time()
+    for epoch in range(current_epoch, 1000000):
         begin = time.time()
 
         # randomly permute
         inds = np.random.permutation(trainx.shape[0])
         trainx = trainx[inds]
-        trainy = trainy[inds] # only used for testing unsupervised features every 50 epochs
-
-        # init
-        if epoch==0:
-            sess.run(initializer, feed_dict={x_init: trainx[:args.batch_size]})
-            if args.load_params:
-                saver.restore(sess, os.path.join(args.save_dir, 'med_gan_params'))
 
         # train
         np_distances_gen = []
@@ -214,7 +223,7 @@ with tf.Session() as sess:
                 npd, e, _, _ = sess.run([total_dist_gen, avg_entropy, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
                 step_counter += 1
                 np_distances_gen.append(npd)
-            np_entropy.append(e)
+                np_entropy.append(e)
 
         # log
         mean_dist_gen.append(np.mean(np_distances_gen))
@@ -224,64 +233,50 @@ with tf.Session() as sess:
         # save generated image
         sample_x = sess.run(x_gens)
         sample_x = np.concatenate(sample_x)
-        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
-        img = plotting.plot_img(img_tile, title='CIFAR10 samples')
-        plotting.plt.savefig(os.path.join(args.save_dir, 'sample%d.png' % epoch))
-        plotting.plt.close('all')
+        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
+        plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'sample%d.png' % epoch))
 
         # save EMA generated image
         sample_x_ema = sess.run(x_gens_ema)
         sample_x_ema = np.concatenate(sample_x_ema)
-        img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
-        img = plotting.plot_img(img_tile, title='CIFAR10 samples')
-        plotting.plt.savefig(os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
-        plotting.plt.close('all')
+        img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
+        plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
 
-        if (epoch+1) % 50 == 0:
+        if (epoch + 1) % 100 == 0 and epoch != current_epoch:
             # save parameters + historical distances
-            saver.save(sess, os.path.join(args.save_dir, 'med_gan_params'), global_step=epoch)
-            np.savez(os.path.join(args.save_dir, 'distances.npz'), mean_dist_gen=np.array(mean_dist_gen), mean_dist_disc=np.array(mean_dist_disc))
-
             # calculate inception score
+            sample_x = []
+            sample_x_ema = []
+            for t in range(test_batches_per_gpu):
+                sample_x_temp = sess.run(x_gens)
+                sample_x_temp = np.concatenate(sample_x_temp)
+                sample_x_ema_temp = sess.run(x_gens_ema)
+                sample_x_ema_temp = np.concatenate(sample_x_ema_temp)
+                sample_x.append(sample_x_temp)
+                sample_x_ema.append(sample_x_ema_temp)
+            sample_x = np.concatenate(sample_x)
+            sample_x_ema = np.concatenate(sample_x_ema)
+
             sample_x = [127.5*(sample_x[i]+1.) for i in range(sample_x.shape[0])]
             sample_x_ema = [127.5 * (sample_x_ema[i] + 1.) for i in range(sample_x_ema.shape[0])]
-            inception_score = get_inception_score(sample_x, splits=1)
-            print('inception score was %.6f' % inception_score[0])
-            inception_score = get_inception_score(sample_x_ema, splits=1)
-            print('EMA inception score was %.6f' % inception_score[0])
+            inception_score = get_inception_score(sample_x[:50000], splits=10)
+            print('inception score was %.6f, std was %.3f' % (inception_score[0], inception_score[1]))
+            if inception_score[0] > max_inception_score:
+                max_inception_score = inception_score[0]
+                max_iter = epoch
+            inception_score = get_inception_score(sample_x_ema[:50000], splits=10)
+            print('EMA inception score was %.6f, std was %.3f ' % (inception_score[0], inception_score[1]))
+            if inception_score[0] > max_inception_score:
+                max_inception_score = inception_score[0]
+                max_iter = epoch
+            print('max inception score was %.6f, iter was %d' % (max_inception_score, max_iter))
+            sys.stdout.flush()
 
-            # /////// test unsupervised classification performance /////////
-
-            # randomly select 1000 labeled training images
-            x_labeled = []
-            for label in range(10):
-                x_labeled.append(trainx[trainy==label][:100])
-            feed_dict = {xph: xd for xph, xd in zip(x_data, np.split(np.concatenate(x_labeled), args.nr_gpu, 0))}
-            x_labeled_features = np.split(np.concatenate(sess.run(features_dat, feed_dict=feed_dict)), 10, 0)
-
-            # get test features
-            test_features = np.zeros((testx.shape[0], num_features), dtype=np.float32)  # pretty big!
-            for t in range(int(np.ceil(testx.shape[0] / (args.nr_gpu * args.batch_size)))):
-                end_ind = np.minimum((t + 1) * args.nr_gpu * args.batch_size, testx.shape[0])
-                start_ind = end_ind - args.nr_gpu * args.batch_size
-                feed_dict = {xph: xd for xph, xd in zip(x_data, np.split(testx[start_ind:end_ind], args.nr_gpu, 0))}
-                test_features[start_ind:end_ind] = np.concatenate(sess.run(features_dat, feed_dict=feed_dict))
-
-            # first nearest neighbor classification
-            distances = []
-            for label in range(10):
-                distances.append(np.amin(1. - np.matmul(test_features, x_labeled_features[label].T), axis=1, keepdims=True))
-            pred_label = np.argmin(np.concatenate(distances,1),1)
-
-            print("unsupervised prediction error was %.2f percent" % (100. * (1. - np.mean((pred_label.astype(np.int64)==testy.astype(np.int64)).astype(np.float64)))))
-
-            # can also try comparing to average representation instead
-            x_labeled_features = [np.mean(f,axis=0) for f in x_labeled_features]
-            distances = []
-            for label in range(10):
-                distances.append(1. - np.matmul(test_features, x_labeled_features[label]))
-            pred_label = np.argmin(np.stack(distances, 1), 1)
-
-            print("unsupervised prediction error using 2nd method was %.2f percent" % (
-            100. * (1. - np.mean((pred_label.astype(np.int64) == testy.astype(np.int64)).astype(np.float64)))))
+        if (epoch + 1) % 200 == 0 and epoch != current_epoch:
+            saver.save(sess, os.path.join(args.save_dir, 'med_gan_params'), global_step=epoch)
+            np.savez(os.path.join(args.save_dir, 'distances.npz'), mean_dist_gen=np.array(mean_dist_gen), mean_dist_disc=np.array(mean_dist_disc))
+            print('current epoch %d, elapsed hours from start epoch %.3f, discriminator updates %d, total updates %d' % (
+                epoch, (time.time()-start_time)/3600, dis_updates, step_counter
+            ))
+            sys.stdout.flush()
 

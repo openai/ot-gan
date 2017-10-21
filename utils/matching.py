@@ -89,7 +89,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
             H = sum(Hs)/half_ngpu
             delta_H = H-target_entropy
             delta_H *= (10./tf.maximum(abs(delta_H),10.))
-            sil[l] = tf.minimum(sil[l] * tf.exp(0.01 * delta_H), 10000.)
+            sil[l] = tf.minimum(sil[l] * tf.exp(0.03 * delta_H), 10000.)
 
         # update lambda and calculate the distance
         lambda_update = sinkhorn_inv_lambda[l].assign(sil[l])

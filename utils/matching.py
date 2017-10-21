@@ -47,7 +47,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
     transport_costs = [dist_a1_a2, dist_a1_b1, dist_a1_b2, dist_b2_b1, dist_a2_b1, dist_a2_b2]
 
     if wasserstein_p == 1:
-        transport_costs = [[tf.sqrt(1e-10 + c) for c in cl] for cl in transport_costs]
+        transport_costs = [[tf.sqrt(1e-8 + c) for c in cl] for cl in transport_costs]
 
     # use Sinkhorn algorithm to do soft assignment
     distances = []
@@ -89,7 +89,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
             H = sum(Hs)/half_ngpu
             delta_H = H-target_entropy
             delta_H *= (10./tf.maximum(abs(delta_H),10.))
-            sil[l] = tf.minimum(sil[l] * tf.exp(0.05 * delta_H), 10000.)
+            sil[l] = tf.minimum(sil[l] * tf.exp(0.03 * delta_H), 10000.)
 
         # update lambda and calculate the distance
         lambda_update = sinkhorn_inv_lambda[l].assign(sil[l])
@@ -103,7 +103,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
             W = sum(Ws) / half_ngpu
 
         if wasserstein_p == 2:
-            W = tf.sqrt(1e-12 + W)
+            W = tf.sqrt(1e-8 + W)
 
         distances.append(W)
         entropies.append(H)

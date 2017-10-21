@@ -13,7 +13,7 @@ import sys
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=3200)
+parser.add_argument('--batch_size', type=int, default=5000)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')

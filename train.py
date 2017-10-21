@@ -13,7 +13,7 @@ import sys
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=5000)
+parser.add_argument('--batch_size', type=int, default=4000)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
@@ -23,11 +23,11 @@ parser.add_argument('--nonlinearity', type=str, default='crelu')
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 parser.add_argument('--nr_gen_per_disc', type=int, default=3, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=500)
-parser.add_argument('--matching_entropy', type=float, default=1.)
+parser.add_argument('--matching_entropy', type=float, default=np.log(0.5))
 parser.add_argument('--wasserstein_p', type=int, default=1)
 parser.add_argument('--model', type=str, default='dcgan')
 parser.add_argument('--load_params', dest='load_params', action='store_true')
-parser.add_argument('--model_name', type=str, default='ot_gan_params-999')
+parser.add_argument('--model_name', type=str, default='ot_gan_params-199')
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
 half_ngpu = args.nr_gpu // 2
@@ -236,7 +236,6 @@ with tf.Session() as sess:
 
         if (epoch + 1) % 200 == 0 and epoch != current_epoch:
             saver.save(sess, os.path.join(args.save_dir, 'ot_gan_params'), global_step=epoch)
-            np.savez(os.path.join(args.save_dir, 'distances.npz'), mean_dist_gen=np.array(mean_dist_gen), mean_dist_disc=np.array(mean_dist_disc))
             print('current epoch %d, elapsed hours from start epoch %.3f, discriminator updates %d, total updates %d' % (
                 epoch, (time.time()-start_time)/3600, dis_updates, step_counter
             ))

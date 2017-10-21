@@ -91,9 +91,6 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
             delta_H *= (10./tf.maximum(abs(delta_H),10.))
             sil[l] = tf.minimum(sil[l] * tf.exp(0.05 * delta_H), 10000.)
 
-            if it == nr_sinkhorn_iter-1:
-                entropies.append(H)
-
         # update lambda and calculate the distance
         lambda_update = sinkhorn_inv_lambda[l].assign(sil[l])
         with tf.control_dependencies([lambda_update]):
@@ -109,6 +106,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
             W = tf.sqrt(1e-12 + W)
 
         distances.append(W)
+        entropies.append(H)
 
     # get loss
     w_a1_a2, w_a1_b1, w_a1_b2, w_b2_b1, w_a2_b1, w_a2_b2 = distances

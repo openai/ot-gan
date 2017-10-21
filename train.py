@@ -165,7 +165,7 @@ with tf.Session() as sess:
 
         # train
         np_distances = []
-        np_entropies = [[]] * 6
+        np_entropies = [[] for i in range(6)]
         for t in range(nr_batches_train_per_gpu):
             feed_dict = {}
             for i in range(args.nr_gpu):

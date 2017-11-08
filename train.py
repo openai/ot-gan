@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 from utils import nn
 from utils import plotting
-from utils.matching import minibatch_energy_distance
+from utils.matching import minibatch_energy_distance2
 from utils.inception import get_inception_score
 from data import cifar10_data
 import sys
@@ -13,7 +13,7 @@ import sys
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=4000)
+parser.add_argument('--batch_size', type=int, default=10000)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
@@ -28,6 +28,7 @@ parser.add_argument('--wasserstein_p', type=int, default=1)
 parser.add_argument('--model', type=str, default='dcgan')
 parser.add_argument('--load_params', dest='load_params', action='store_true')
 parser.add_argument('--model_name', type=str, default='ot_gan_params-199')
+parser.add_argument('--nr_epochs', type=int, default=10000)
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
 half_ngpu = args.nr_gpu // 2
@@ -62,7 +63,7 @@ ema = tf.train.ExponentialMovingAverage(decay=0.999)
 maintain_averages_op = ema.apply(gen_params)
 
 # data placeholders
-x_data = [tf.placeholder(tf.float32, shape=(None, 32, 32, 3)) for i in range(args.nr_gpu)]
+x_data = [tf.placeholder(tf.float32, shape=(bs_per_gpu, 32, 32, 3)) for i in range(args.nr_gpu)]
 
 # generate samples
 x_gens = []
@@ -94,7 +95,7 @@ for i in range(args.nr_gpu):
         features_gen[i] /= normalizer
 
 # match samples and get loss
-loss, entropies = minibatch_energy_distance(features_gen, features_dat, args.matching_entropy, args.nr_sinkhorn_iter, args.wasserstein_p)
+loss, entropies = minibatch_energy_distance2(features_gen, features_dat, args.matching_entropy, args.nr_sinkhorn_iter, args.wasserstein_p)
 
 # get gradients for generator and discriminator
 grads_gen = tf.gradients(loss, gen_params, colocate_gradients_with_ops=True)
@@ -156,8 +157,10 @@ with tf.Session() as sess:
         current_epoch = int(args.model_name[ix + 1:])
 
     start_time = time.time()
-    for epoch in range(current_epoch, 1000000):
+    for epoch in range(current_epoch, args.nr_epochs):
         begin = time.time()
+        lr_gen = args.learning_rate_gen * (args.nr_epochs - epoch) / args.nr_epochs
+        lr_disc = args.learning_rate_disc * (args.nr_epochs - epoch) / args.nr_epochs
 
         # randomly permute
         inds = np.random.permutation(trainx.shape[0])
@@ -170,21 +173,24 @@ with tf.Session() as sess:
             feed_dict = {}
             for i in range(args.nr_gpu):
                 td = t + i * nr_batches_train_per_gpu
-                feed_dict[x_data[i]] = maybe_flip(trainx[td *bs_per_gpu:(td + 1) * bs_per_gpu])
+                feed_dict[x_data[i]] = maybe_flip(trainx[td * bs_per_gpu:(td + 1) * bs_per_gpu])
 
             # train discriminator once every args.nr_gen_per_disc batches
-            if step_counter % (args.nr_gen_per_disc+1) == 0:
-                feed_dict.update({tf_lr: args.learning_rate_disc})
-                res = sess.run(entropies+[disc_optimizer], feed_dict=feed_dict)
-                for i in range(6):
-                    np_entropies[i].append(res[i])
-                step_counter += 1
-
-            else: # train generator
-                feed_dict.update({tf_lr: args.learning_rate_gen})
-                npd,_,_ = sess.run([loss, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
+            if step_counter % (args.nr_gen_per_disc + 1) == 0:
+                feed_dict.update({tf_lr: lr_disc})
+                npd, e, _ = sess.run([loss, entropies, disc_optimizer], feed_dict=feed_dict)
                 step_counter += 1
                 np_distances.append(npd)
+                for i in range(6):
+                    np_entropies[i].append(e[i])
+
+            else:  # train generator
+                feed_dict.update({tf_lr: lr_gen})
+                npd, e, _, _ = sess.run([loss, entropies, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
+                step_counter += 1
+                np_distances.append(npd)
+                for i in range(6):
+                    np_entropies[i].append(e[i])
 
         # log
         log_str = "Iteration %d, time = %ds, train distance = %.6f, entropies" % (epoch, time.time()-begin, np.mean(np_distances))

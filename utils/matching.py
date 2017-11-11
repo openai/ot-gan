@@ -1,5 +1,8 @@
 import tensorflow as tf
 
+def safe_sqrt(x):
+    return tf.sqrt(tf.maximum(x, 1e-8))
+
 def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhorn_iter, wasserstein_p=1):
     ngpu = len(features_a)
     half_ngpu = ngpu // 2
@@ -47,7 +50,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
                        tf.concat(cost_a1_b2, 0), tf.concat(cost_a2_b1, 0), tf.concat(cost_a2_b2, 0)]
 
     if wasserstein_p == 1:
-        transport_costs = [tf.sqrt(1e-8 + c) for c in transport_costs]
+        transport_costs = [safe_sqrt(c) for c in transport_costs]
 
     # use Sinkhorn algorithm to do soft assignment
     entropies = []
@@ -77,7 +80,7 @@ def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhor
                 H = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=M, logits=log_a))
                 W = tf.reduce_sum(M * C) / (half_ngpu*n)
                 if wasserstein_p == 2:
-                    W = tf.sqrt(1e-8 + W)
+                    W = safe_sqrt(W)
 
             entropies.append(H)
             sinkhorn_distances.append(W)
@@ -135,7 +138,7 @@ def minibatch_energy_distance2(features_a, features_b, target_entropy, nr_sinkho
     transport_costs = [cost_a1_a2, cost_a1_b1, cost_a1_b2, cost_b2_b1, cost_a2_b1, cost_a2_b2]
 
     if wasserstein_p == 1:
-        transport_costs = [[tf.sqrt(1e-8 + c) for c in cl] for cl in transport_costs]
+        transport_costs = [[safe_sqrt(c) for c in cl] for cl in transport_costs]
 
     # use Sinkhorn algorithm to do soft assignment
     sinkhorn_distances = []
@@ -201,7 +204,7 @@ def minibatch_energy_distance2(features_a, features_b, target_entropy, nr_sinkho
         H = sum(Hs) / half_ngpu
         W = sum(Ws) / (half_ngpu * n)
         if wasserstein_p == 2:
-            W = tf.sqrt(1e-8 + W)
+            W = safe_sqrt(W)
         entropies.append(H)
         sinkhorn_distances.append(W)
 

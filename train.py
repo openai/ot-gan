@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow as tf
 from utils import nn
 from utils import plotting
-from utils.matching import minibatch_energy_distance2
+from utils.matching import minibatch_energy_distance
 from utils.inception import get_inception_score
 from data import cifar10_data
 import sys
@@ -14,11 +14,12 @@ import sys
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
 parser.add_argument('--batch_size', type=int, default=10000)
-parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
-parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
+parser.add_argument('--learning_rate_disc', type=float, default=0.001)
+parser.add_argument('--learning_rate_gen', type=float, default=0.001)
+parser.add_argument('--learning_rate_decay', type=float, default=0.9995)
 parser.add_argument('--data_dir', type=str, default='/home/tim/data')
 parser.add_argument('--save_dir', type=str, default='/local_home/tim/ot_gan')
-parser.add_argument('--optimizer', type=str, default='adam')
+parser.add_argument('--optimizer', type=str, default='adamax')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
 parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 parser.add_argument('--nr_gen_per_disc', type=int, default=3, help='How many times to update the generator for each update of the discriminator?')
@@ -27,7 +28,7 @@ parser.add_argument('--matching_entropy', type=float, default=-np.log(0.5))
 parser.add_argument('--wasserstein_p', type=int, default=1)
 parser.add_argument('--model', type=str, default='dcgan')
 parser.add_argument('--load_params', dest='load_params', action='store_true')
-parser.add_argument('--model_name', type=str, default='ot_gan_params-199')
+parser.add_argument('--model_name', type=str, default='ot_gan_params-999')
 parser.add_argument('--nr_epochs', type=int, default=10000)
 args = parser.parse_args()
 assert args.nr_gpu % 2 == 0
@@ -95,24 +96,24 @@ for i in range(args.nr_gpu):
         features_gen[i] /= normalizer
 
 # match samples and get loss
-loss, entropies = minibatch_energy_distance2(features_gen, features_dat, args.matching_entropy, args.nr_sinkhorn_iter, args.wasserstein_p)
+loss, entropies = minibatch_energy_distance(features_gen, features_dat, args.matching_entropy, args.nr_sinkhorn_iter, args.wasserstein_p)
 
 # get gradients for generator and discriminator
 grads_gen = tf.gradients(loss, gen_params, colocate_gradients_with_ops=True)
-grads_disc = tf.gradients(loss, disc_params, colocate_gradients_with_ops=True)
+grads_disc = tf.gradients(-loss, disc_params, colocate_gradients_with_ops=True)
 
 # get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
 with tf.device('/gpu:0'):
     if args.optimizer == 'adam':
-        gen_optimizer = nn.adam_updates(gen_params, grads_gen, lr=tf_lr, mom1=0.5, mom2=0.999)
-        disc_optimizer = nn.adam_updates(disc_params, grads_disc, lr=-tf_lr, mom1=0.5, mom2=0.999)
+        gen_optimizer = nn.adam_updates(gen_params, grads_gen, lr=tf_lr, mom1=0., mom2=0.99)
+        disc_optimizer = nn.adam_updates(disc_params, grads_disc, lr=tf_lr, mom1=0., mom2=0.99)
     elif args.optimizer == 'adamax':
-        gen_optimizer = nn.adamax_updates(gen_params, grads_gen, lr=tf_lr, mom1=0.5, mom2=0.999)
-        disc_optimizer = nn.adamax_updates(disc_params, grads_disc, lr=-tf_lr, mom1=0.5, mom2=0.999)
+        gen_optimizer = nn.adamax_updates(gen_params, grads_gen, lr=tf_lr, mom1=0., mom2=0.99)
+        disc_optimizer = nn.adamax_updates(disc_params, grads_disc, lr=tf_lr, mom1=0., mom2=0.99)
     elif args.optimizer == 'nesterov':
         gen_optimizer = nn.nesterov_updates(gen_params, grads_gen, lr=tf_lr, mom1=0.5)
-        disc_optimizer = nn.nesterov_updates(disc_params, grads_disc, lr=-tf_lr, mom1=0.5)
+        disc_optimizer = nn.nesterov_updates(disc_params, grads_disc, lr=tf_lr, mom1=0.5)
     else:
         raise ('unsupported optimizer')
 
@@ -126,14 +127,6 @@ nr_batches_train_per_gpu = trainx.shape[0]//args.batch_size
 testx, testy = cifar10_data.load(args.data_dir + '/cifar-10-python', subset='test')
 testx = np.transpose(testx, (0,2,3,1))/127.5 - 1.
 
-def maybe_flip(x):
-    x_out = np.zeros_like(x)
-    for i in range(x.shape[0]):
-        if np.random.rand() < 0.5:
-            x_out[i] = x[i,:,::-1,:]
-        else:
-            x_out[i] = x[i]
-    return x_out
 
 # //////////// perform training //////////////
 try:
@@ -143,7 +136,6 @@ except:
 print('starting training')
 step_counter = 0
 
-dis_updates = 0
 test_batches_per_gpu = 50000 // args.batch_size + 1
 max_inception_score = 0
 max_iter = 0
@@ -159,8 +151,8 @@ with tf.Session() as sess:
     start_time = time.time()
     for epoch in range(current_epoch, args.nr_epochs):
         begin = time.time()
-        lr_gen = args.learning_rate_gen * (args.nr_epochs - epoch) / args.nr_epochs
-        lr_disc = args.learning_rate_disc * (args.nr_epochs - epoch) / args.nr_epochs
+        lr_gen = args.learning_rate_gen * args.learning_rate_decay ** epoch
+        lr_disc = args.learning_rate_disc * args.learning_rate_decay ** epoch
 
         # randomly permute
         inds = np.random.permutation(trainx.shape[0])
@@ -173,7 +165,7 @@ with tf.Session() as sess:
             feed_dict = {}
             for i in range(args.nr_gpu):
                 td = t + i * nr_batches_train_per_gpu
-                feed_dict[x_data[i]] = maybe_flip(trainx[td * bs_per_gpu:(td + 1) * bs_per_gpu])
+                feed_dict[x_data[i]] = trainx[td * bs_per_gpu:(td + 1) * bs_per_gpu]
 
             # train discriminator once every args.nr_gen_per_disc batches
             if step_counter % (args.nr_gen_per_disc + 1) == 0:
@@ -242,8 +234,8 @@ with tf.Session() as sess:
 
         if (epoch + 1) % 200 == 0 and epoch != current_epoch:
             saver.save(sess, os.path.join(args.save_dir, 'ot_gan_params'), global_step=epoch)
-            print('current epoch %d, elapsed hours from start epoch %.3f, discriminator updates %d, total updates %d' % (
-                epoch, (time.time()-start_time)/3600, dis_updates, step_counter
+            print('current epoch %d, elapsed hours from start epoch %.3f, total updates %d' % (
+                epoch, (time.time()-start_time)/3600, step_counter
             ))
             sys.stdout.flush()
 

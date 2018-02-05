@@ -1,30 +1,6 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.contrib.framework.python.ops import add_arg_scope
-from tensorflow.python.framework import function as tff
-
-def energy_distance(f_sample, f_data):
-    nr_chunks = len(f_sample)
-    f_sample = np.concatenate(f_sample)
-    f_data = np.concatenate(f_data)
-    grads = np.zeros_like(f_sample)
-    for j in range(f_sample.shape[1]):
-        sample_ind = np.argsort(f_sample[:,j])
-        data_ind = np.argsort(f_data[:,j])
-        grads[sample_ind,j] = f_sample[sample_ind,j] - f_data[data_ind,j]
-    loss = np.mean(np.square(grads))
-    grads = np.split(grads,nr_chunks,0)
-    return loss,grads
-
-def int_shape(x):
-    return x.get_shape().as_list() #[int(s) if s is not None else None for s in x.get_shape()]
-
-def weight_decay(params):
-    loss = 0.
-    for p in params:
-        if len(p.get_shape())>=2:
-            loss += tf.reduce_sum(tf.square(p))
-    return loss
 
 def adamax_updates(params, cost_or_grads, lr=0.001, mom1=0.9, mom2=0.999):
     updates = []
@@ -106,10 +82,10 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
     with tf.variable_scope(layer_name):
         if init:
             if type(x) is list:
-                xs = int_shape(x[0])
-                xs[-1] = np.sum([int_shape(xi)[-1] for xi in x])
+                xs = x[0].get_shape().as_list()
+                xs[-1] = np.sum([xi.get_shape().as_list()[-1] for xi in x])
             else:
-                xs = int_shape(x)
+                xs = x.get_shape().as_list()
             if num_units is None:
                 num_units = xs[-1]
             norm_axes = [i for i in np.arange(len(xs) - 1)]
@@ -171,7 +147,7 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
                     params['g'] = g
             if use_W:
                 V = get_var_maybe_avg('V', ema)
-                Vs = int_shape(V)
+                Vs = V.get_shape().as_list()
                 if weight_norm:
                     W = tf.nn.l2_normalize(V, [i for i in np.arange(len(Vs)-1)])
                 else:
@@ -181,11 +157,6 @@ def get_params(layer_name, x=None, init=False, ema=None, use_W=True, use_g=True,
                 params['W'] = W
 
     return params
-
-
-''' memory saving stuff '''
-
-mem_funcs = {}
 
 def apply_pre_activation(x, pre_activation, axis=3):
     if type(x) is tuple:
@@ -205,111 +176,17 @@ def apply_pre_activation(x, pre_activation, axis=3):
     else:
         raise('unsupported pre-activation')
 
-def __dense(W, pre_activation, x):
-    return tf.matmul(apply_pre_activation(x, pre_activation, 1), W)
-
-def __dense_grad(op, grad, pre_activation):
-    with tf.control_dependencies([grad]):
-        W,x = op.inputs
-        y = __dense(W, pre_activation, x)
-        grads = tf.gradients(ys=y,xs=[W,x],grad_ys=grad)
-    return grads
-
-def _dense(x, W, pre_activation=None, mem_funcs=mem_funcs):
-    func_name = ('_dense'+str(pre_activation)).replace(' ','_').replace('[','_').replace(']','_').replace(',','_')
-    if func_name in mem_funcs:
-        my_func = mem_funcs[func_name]
-    else:
-        my_grad = lambda op,grad: __dense_grad(op, grad, pre_activation)
-        #@tff.Defun(tf.float32, tf.float32, func_name=func_name, python_grad_func=my_grad)
-        def my_func(W,x):
-            return __dense(W, pre_activation, x)
-        mem_funcs[func_name] = my_func
-    x_out = my_func(W, x)
-    xs = int_shape(x)
-    xs[-1] = int_shape(W)[-1]
-    x_out.set_shape(xs)
+def _dense(x, W, pre_activation=None):
+    x_out = tf.matmul(apply_pre_activation(x, pre_activation, 1), W)
     return x_out
 
-def __list_conv2d(W, stride, pad, dilate, pre_activation, upsample, xs, *x_list):
-    if upsample:
-        x_list = tf.image.resize_nearest_neighbor(tf.concat(x_list,3), [xs[1],xs[2]])
-    x = apply_pre_activation(x_list, pre_activation, 3)
-    if dilate>1:
-        return tf.nn.atrous_conv2d(x, W, dilate, pad)
+def _conv2d(x, W, stride=[1,1], pad='SAME', dilate=1, pre_activation=None):
+    x = apply_pre_activation(x, pre_activation, 3)
+    if dilate > 1:
+        x_out = tf.nn.atrous_conv2d(x, W, dilate, pad)
     else:
-        return tf.nn.conv2d(x, W, [1]+stride+[1], pad)
-
-def __list_conv2d_grad(op, grad, stride, pad, dilate, pre_activation, upsample, xs):
-    with tf.control_dependencies([grad]):
-        W = tf.stop_gradient(op.inputs[0])
-        x_list = [tf.stop_gradient(x) for x in op.inputs[1:]]
-        y = __list_conv2d(W, stride, pad, dilate, pre_activation, upsample, xs, *x_list)
-        grads = tf.gradients(ys=y, xs=[W]+x_list, grad_ys=grad)
-    return grads
-
-def _conv2d(x, W, stride=[1,1], pad='SAME', dilate=1, pre_activation=None, upsample=False, mem_funcs=mem_funcs):
-    if type(x) is tuple:
-        x = list(x)
-    elif type(x) is not list:
-        x = [x]
-    xs = int_shape(x[-1])
-    if upsample:
-        xs[1] = int(2*xs[1])
-        xs[2] = int(2*xs[2])
-    func_name = ('_conv2d'+str(len(x))+'_'+str(stride)+'_'+str(pad)+'_'+str(dilate)+'_'+str(pre_activation)+'_'+str(upsample)).replace(' ','_').replace('[','_').replace(']','_').replace(',','_')
-    if func_name in mem_funcs:
-        my_func = mem_funcs[func_name]
-    else:
-        my_grad = lambda op, grad: __list_conv2d_grad(op, grad, stride, pad, dilate, pre_activation, upsample, xs)
-        #@tff.Defun(*([tf.float32] * (len(x) + 1)), func_name=func_name, python_grad_func=my_grad)
-        def my_func(W, *x_list):
-            return __list_conv2d(W, stride, pad, dilate, pre_activation, upsample, xs, *x_list)
-        mem_funcs[func_name] = my_func
-
-    x_out = my_func(W, *x)
-    xs[-1] = int_shape(W)[-1]
-    xs[1] = int(xs[1]/stride[0])
-    xs[2] = int(xs[2]/stride[1])
-    x_out.set_shape(xs)
+        x_out = tf.nn.conv2d(x, W, [1] + stride + [1], pad)
     return x_out
-
-def __list_global_avg_pool(pre_activation, *x_list):
-    return tf.reduce_mean(apply_pre_activation(x_list, pre_activation, 3), [1,2])
-
-def __list_global_avg_pool_grad(op, grad, pre_activation):
-    with tf.control_dependencies([grad]):
-        x_list = [tf.stop_gradient(x) for x in op.inputs]
-        y = __list_global_avg_pool(pre_activation, *x_list)
-        grads = tf.gradients(ys=y, xs=x_list, grad_ys=grad)
-    return grads
-
-def global_avg_pool(x, pre_activation='celu', mem_funcs=mem_funcs):
-    if type(x) is tuple:
-        x = list(x)
-    elif type(x) is not list:
-        x = [x]
-    n_in = int_shape(x[0])[0]
-    c_in = np.sum([int_shape(xi)[-1] for xi in x])
-    func_name = ('global_avg_pool_'+str(len(x))+'_'+str(pre_activation)).replace(' ','_').replace('[','_').replace(']','_').replace(',','_')
-    if func_name in mem_funcs:
-        my_func = mem_funcs[func_name]
-    else:
-        my_grad = lambda op, grad: __list_global_avg_pool_grad(op, grad, pre_activation)
-        #@tff.Defun(*([tf.float32] * len(x)), func_name=func_name, python_grad_func=my_grad)
-        def my_func(*x_list):
-            return __list_global_avg_pool(pre_activation, *x_list)
-        mem_funcs[func_name] = my_func
-    if pre_activation in ['celu', 'crelu']:
-        c_out = int(2*c_in)
-    else:
-        c_out = int(c_in)
-    x_out = my_func(*x)
-    x_out.set_shape([n_in, c_out])
-    return x_out
-
-
-''' layer definitions '''
 
 @add_arg_scope
 def dense(x, num_units, pre_activation='celu', init_scale=1., counters={}, init=False,
@@ -318,20 +195,18 @@ def dense(x, num_units, pre_activation='celu', init_scale=1., counters={}, init=
     f = lambda x, W: _dense(x, W, pre_activation)
     params = get_params(layer_name, x, init, ema, use_W=True, use_g=use_g, use_b=use_b, f=f,
                         weight_norm=weight_norm, init_scale=init_scale, num_units=num_units, pre_activation=pre_activation)
-
     x = f(x, params['W'])
     if use_b:
         x = tf.nn.bias_add(x, params['b'])
     return x
 
 @add_arg_scope
-def conv2d(x, num_filters, pre_activation='celu', filter_size=[3,3], stride=[1,1], pad='SAME', dilate=1, upsample=False,
+def conv2d(x, num_filters, pre_activation='celu', filter_size=[3,3], stride=[1,1], pad='SAME', dilate=1,
            init_scale=1., counters={}, init=False, ema=None, weight_norm=True, use_b=True, use_g=True, **kwargs):
     layer_name = get_name('conv2d', counters)
-    f = lambda x,W: _conv2d(x, W, stride, pad, dilate, pre_activation, upsample)
+    f = lambda x,W: _conv2d(x, W, stride, pad, dilate, pre_activation)
     params = get_params(layer_name, x, init, ema, use_W=True, use_g=use_g, use_b=use_b, f=f,
                         weight_norm=weight_norm, init_scale=init_scale, filter_size=filter_size, num_units=num_filters, pre_activation=pre_activation)
-
     x = f(x, params['W'])
     if use_b:
         x = tf.nn.bias_add(x, params['b'])

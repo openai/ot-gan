@@ -24,8 +24,7 @@ discriminator = tf.make_template('discriminator', disc_spec)
 
 
 # //// generator ////
-def gen_spec(batch_size, init=False, nonlinearity='crelu', ema=None, **kwargs):
-
+def gen_spec(batch_size, init=False, ema=None, **kwargs):
     u = tf.random_uniform(shape=(batch_size, 100), minval=-1., maxval=1.)
 
     with arg_scope([nn.conv2d, nn.dense], counters={}, init=init, weight_norm=True, ema=ema):

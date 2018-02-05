@@ -12,10 +12,10 @@ def disc_spec(x, init=False, nonlinearity='crelu', ema=None, **kwargs):
         x = nn.conv2d(x, 256, filter_size=[5,5], pre_activation=nonlinearity, stride=[2, 2])
         x = nn.conv2d(x, 512, filter_size=[5,5], pre_activation=nonlinearity, stride=[2, 2])
         x = nn.conv2d(x, 1024, filter_size=[5,5], pre_activation=nonlinearity, stride=[2, 2])
-
-        x = tf.concat([tf.nn.relu(x), tf.nn.relu(-x)],3)
         xs = x.get_shape().as_list()
         x = tf.reshape(x, [-1, np.prod(xs[1:])])
+        x = nn.dense(x, 1024, pre_activation=nonlinearity)
+        x /= tf.sqrt(tf.reduce_mean(tf.square(x),axis=1,keepdims=True)) # normalization for cosine distance
 
         # return the features
         return x

@@ -1,71 +1,80 @@
 import tensorflow as tf
+import horovod.tensorflow as hvd
+from horovod.tensorflow import allgather, allreduce
+rnk = hvd.rank()
 
-def safe_sqrt(x):
-    return tf.sqrt(tf.maximum(x, 1e-8))
+def minibatch_energy_distance(features_a, features_b, sinkhorn_inv_lambda, nr_sinkhorn_iter):
+    n,k = features_a.get_shape().as_list()
+    half_n = n//2
 
-def sinkhorn_distance(x, y, target_entropy, nr_sinkhorn_iter, wasserstein_p=1):
-
-    # globally normalize features to avoid blowing up the cost
-    x /= tf.sqrt(tf.reduce_mean(tf.square(x)))
-    y /= tf.sqrt(tf.reduce_mean(tf.square(y)))
-
-    # calculate transport cost matrix
-    yt = tf.transpose(y,(1,0))
-    n,k = x.get_shape().as_list()
-    cost = tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + tf.reduce_mean(tf.square(yt), axis=0, keepdims=True) - (2. / k) * tf.matmul(x, yt)
-    if wasserstein_p == 1:
-        cost = safe_sqrt(cost)
+    # split features into two batches, gather, calculate transport costs
+    fa1 = features_a[:half_n]
+    fa2 = features_a[half_n:]
+    fb1 = features_b[:half_n]
+    fb2 = features_b[half_n:]
+    all_fa2 = allgather(fa2)
+    all_fb1 = allgather(fb1)
+    all_fb2 = allgather(fb2)
+    costs = {}
+    costs['a1_a2'] = 1. - (1. / k) * tf.matmul(fa1, all_fa2, transpose_b=True)
+    costs['a1_b1'] = 1. - (1. / k) * tf.matmul(fa1, all_fb1, transpose_b=True)
+    costs['a1_b2'] = 1. - (1. / k) * tf.matmul(fa1, all_fb2, transpose_b=True)
+    costs['a2_b1'] = 1. - (1. / k) * tf.matmul(fa2, all_fb1, transpose_b=True)
+    costs['a2_b2'] = 1. - (1. / k) * tf.matmul(fa2, all_fb2, transpose_b=True)
+    costs['b2_b1'] = 1. - (1. / k) * tf.matmul(fb2, all_fb1, transpose_b=True)
 
     # use Sinkhorn algorithm to do soft assignment
-    sinkhorn_inv_lambda = tf.Variable(500., dtype=tf.float32, trainable=False)
-    log_a = -sinkhorn_inv_lambda * cost
-    for it in range(nr_sinkhorn_iter):
-        log_a -= tf.reduce_logsumexp(log_a, axis=1, keepdims=True)
-        log_a -= tf.reduce_logsumexp(log_a, axis=0, keepdims=True)
+    assignments = {}
+    assignments_transposed = {}
+    entropies = {}
+    summed_costs = {}
+    for k, C in costs:
+        log_a = -sinkhorn_inv_lambda * C
 
-    # adjust Sinkhorn lambda
-    M = tf.stop_gradient((tf.nn.softmax(log_a, axis=1) + tf.nn.softmax(log_a, axis=0)) / 2.)
-    H = -tf.reduce_sum(M * log_a) / n
-    delta_H = H - target_entropy
-    delta_H *= (10. / tf.maximum(abs(delta_H), 10.))
-    new_inv_lambda = tf.minimum(sinkhorn_inv_lambda * tf.exp(0.1 * delta_H), 100000.)
+        for it in range(nr_sinkhorn_iter):
+            # rows
+            log_a -= tf.reduce_logsumexp(log_a, axis=1, keep_dims=True)
 
-    # final Sinkhorn distance
-    with tf.control_dependencies([sinkhorn_inv_lambda.assign(new_inv_lambda)]):
-        W = tf.reduce_sum(M * cost) / n
-        if wasserstein_p == 2:
-            W = tf.sqrt(W)
+            # cols
+            log_sum_col = tf.reduce_logsumexp(log_a, axis=0, keep_dims=True)
+            all_log_sum_col = allgather(log_sum_col)
+            log_a -= tf.reduce_logsumexp(all_log_sum_col, axis=0, keep_dims=True)
 
-    return W,H
+        assignments[k] = tf.nn.softmax(log_a) # normalized rows
+        assignments_transposed[k] = tf.exp(log_a) # normalized cols
+        entropies[k] = allreduce(tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=assignments[k], logits=log_a)), average=True)
+        summed_costs[k] = allreduce(tf.reduce_sum(assignments[k]*C), average=False)
 
-def minibatch_energy_distance(features_a, features_b, target_entropy, nr_sinkhorn_iter, wasserstein_p=1):
-    assert isinstance(features_a, list)
-    ngpu = len(features_a)
-    assert len(features_b) == ngpu
-    half_ngpu = ngpu // 2
+    med_loss = 0.5 * (summed_costs['a1_b1'] + summed_costs['a1_b2'] + summed_costs['a2_b1'] + summed_costs['a2_b2']) \
+               - summed_costs['a1_a2'] - summed_costs['b2_b1'] # ignoring the entropies in the sinkhorn distance
 
-    # gather features, split into two batches
-    fa1 = tf.concat(features_a[:half_ngpu], axis=0)
-    fa2 = tf.concat(features_a[half_ngpu:], axis=0)
-    fb1 = tf.concat(features_b[:half_ngpu], axis=0)
-    fb2 = tf.concat(features_b[half_ngpu:], axis=0)
+    # get all matched features for calculating gradients
+    features_a1_a2_matched = tf.matmul(assignments['a1_a2'], all_fa2)
+    features_a1_b1_matched = tf.matmul(assignments['a1_b1'], all_fb1)
+    features_a1_b2_matched = tf.matmul(assignments['a1_b2'], all_fb2)
+    features_a2_b1_matched = tf.matmul(assignments['a2_b1'], all_fb1)
+    features_a2_b2_matched = tf.matmul(assignments['a2_b2'], all_fb2)
+    features_b2_b1_matched = tf.matmul(assignments['b2_b1'], all_fb1)
 
-    # calculate all Sinkhorn distances
-    with tf.device('gpu:0'):
-        W_a1_a2, H_a1_a2 = sinkhorn_distance(fa1, fa2, target_entropy, nr_sinkhorn_iter, wasserstein_p)
-    with tf.device('gpu:%s' % (1 % ngpu)):
-        W_b2_b1, H_b2_b1 = sinkhorn_distance(fb2, fb1, target_entropy, nr_sinkhorn_iter, wasserstein_p)
-    with tf.device('gpu:%s' % (2 % ngpu)):
-        W_a1_b1, H_a1_b1 = sinkhorn_distance(fa1, fb1, target_entropy, nr_sinkhorn_iter, wasserstein_p)
-    with tf.device('gpu:%s' % (3 % ngpu)):
-        W_a1_b2, H_a1_b2 = sinkhorn_distance(fa1, fb2, target_entropy, nr_sinkhorn_iter, wasserstein_p)
-    with tf.device('gpu:%s' % (4 % ngpu)):
-        W_a2_b1, H_a2_b1 = sinkhorn_distance(fa2, fb1, target_entropy, nr_sinkhorn_iter, wasserstein_p)
-    with tf.device('gpu:%s' % (5 % ngpu)):
-        W_a2_b2, H_a2_b2 = sinkhorn_distance(fa2, fb2, target_entropy, nr_sinkhorn_iter, wasserstein_p)
+    # horovod does not support reduce, so being a bit inefficient here
+    features_b1_b2_matched = allreduce(tf.matmul(assignments_transposed['b2_b1'], fb2, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
+    features_a2_a1_matched = allreduce(tf.matmul(assignments_transposed['a1_a2'], fa1, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
+    features_b1_a1_matched = allreduce(tf.matmul(assignments_transposed['a1_b1'], fa1, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
+    features_b2_a1_matched = allreduce(tf.matmul(assignments_transposed['a1_b2'], fa1, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
+    features_b1_a2_matched = allreduce(tf.matmul(assignments_transposed['a2_b1'], fa2, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
+    features_b2_a2_matched = allreduce(tf.matmul(assignments_transposed['a2_b2'], fa2, transpose_a=True),
+                                       average=False)[rnk*half_n:(rnk+1)*half_n]
 
-    # get minibatch energy distance
-    med_loss = 0.5*(W_a1_b1 + W_a1_b2 + W_a2_b1 + W_a2_b2) - W_a1_a2 - W_b2_b1
-    entropies = [H_a1_b1, H_a1_b2, H_a2_b1, H_a2_b2, H_a1_a2, H_b2_b1]
-    
-    return med_loss, entropies
+    features_a_a = tf.concat([features_a1_a2_matched, features_a2_a1_matched],axis=0)
+    features_b_b = tf.concat([features_b1_b2_matched, features_b2_b1_matched],axis=0)
+    features_a_b = 0.5 * (tf.concat([features_a1_b1_matched, features_a2_b1_matched],axis=0)
+                          + tf.concat([features_a1_b2_matched, features_a2_b2_matched],axis=0))
+    features_b_a = 0.5 * (tf.concat([features_b1_a1_matched, features_b2_a1_matched],axis=0)
+                          + tf.concat([features_b1_a2_matched, features_b2_a2_matched],axis=0))
+
+    return med_loss, entropies, features_a_b, features_a_a, features_b_a, features_b_b

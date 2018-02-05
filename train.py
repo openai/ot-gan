@@ -1,42 +1,35 @@
 import argparse
 import time
 import os
+import sys
 import numpy as np
 import tensorflow as tf
-from utils import nn
+import horovod.tensorflow as hvd
 from utils import plotting
 from utils.matching import minibatch_energy_distance
 from utils.inception import get_inception_score
+from models.dcgan import generator, discriminator
 from data import cifar10_data
-import sys
 
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--batch_size', type=int, default=10000)
+parser.add_argument('--batch_size', type=int, default=60000)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--momentum', type=float, default=0.5)
-parser.add_argument('--data_dir', type=str, default='/home/tim/data')
-parser.add_argument('--save_dir', type=str, default='/local_home/tim/ot_gan')
-parser.add_argument('--optimizer', type=str, default='adam')
+parser.add_argument('--data_dir', type=str, default='/root/data')
+parser.add_argument('--save_dir', type=str, default='/root/results/ot_gan')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
-parser.add_argument('--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
-parser.add_argument('--nr_gen_per_disc', type=int, default=1, help='How many times to update the generator for each update of the discriminator?')
+parser.add_argument('--nr_gen_per_disc', type=int, default=3, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=500)
-parser.add_argument('--matching_entropy', type=float, default=-np.log(0.5))
-parser.add_argument('--wasserstein_p', type=int, default=1)
+parser.add_argument('--sinkhorn_inv_lambda', type=float, default=500.)
 parser.add_argument('--load_params', dest='load_params', action='store_true')
 parser.add_argument('--model_name', type=str, default='ot_gan_params-999')
 parser.add_argument('--nr_epochs', type=int, default=10000)
 args = parser.parse_args()
-assert args.nr_gpu % 2 == 0
-half_ngpu = args.nr_gpu // 2
 print(args)
-bs_per_gpu = args.batch_size // args.nr_gpu
-
-from models.dcgan import generator
-from models.revnet import discriminator
+bs_per_gpu = args.batch_size // hvd.size()
 
 # extract model settings
 model_opts = {'batch_size': bs_per_gpu, 'nonlinearity': args.nonlinearity}
@@ -61,83 +54,84 @@ gen_params = [p for p in all_params if 'generator' in p.name]
 ema = tf.train.ExponentialMovingAverage(decay=0.99)
 maintain_averages_op = ema.apply(gen_params)
 
-# data placeholders
-x_data = [tf.placeholder(tf.float32, shape=(bs_per_gpu, 32, 32, 3)) for i in range(args.nr_gpu)]
+# data placeholder
+x_data = tf.placeholder(tf.float32, shape=(bs_per_gpu, 32, 32, 3))
 
 # generate samples
-x_gens = []
-x_gens_ema = []
-for i in range(args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        x_gens.append(generator(**model_opts))
-        x_gens_ema.append(generator(ema=ema, **model_opts))
+x_gen = generator(**model_opts)
+x_gen_ema = generator(ema=ema, **model_opts)
 
 # feature extraction
-features_dat = []
-features_gen = []
-for i in range(args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        features_dat.append(discriminator(x_data[i], **model_opts))
-        features_gen.append(discriminator(x_gens[i], **model_opts))
+features_dat = discriminator(x_data, **model_opts)
+features_gen = discriminator(x_gen, **model_opts)
 
-# match samples and get loss
-assert len(features_gen) == 8
-assert args.nr_gpu//2 == 4
-loss, entropies = minibatch_energy_distance(features_gen, features_dat, args.matching_entropy, args.nr_sinkhorn_iter, args.wasserstein_p)
+# match samples and get loss, uses MPI internally
+loss, entropies, matched_features_gen_dat, matched_features_gen_gen, matched_features_dat_gen, matched_features_dat_dat =\
+    minibatch_energy_distance(features_gen, features_dat, args.sinkhorn_inv_lambda, args.nr_sinkhorn_iter)
 
 # get gradients for generator and discriminator
-grads_gen = tf.gradients(loss, gen_params, colocate_gradients_with_ops=True)
-grads_disc = tf.gradients(-loss, disc_params, colocate_gradients_with_ops=True)
+grads_gen = tf.gradients(ys=features_gen, grad_ys=matched_features_gen_gen-matched_features_gen_dat,
+                         xs=gen_params, colocate_gradients_with_ops=True)
+grads_disc = tf.gradients(ys=[features_gen, features_dat],
+                          grad_ys=[matched_features_gen_dat-matched_features_gen_gen,
+                                   matched_features_dat_gen-matched_features_dat_dat],
+                          xs=disc_params, colocate_gradients_with_ops=True)
 
 # get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
-with tf.device('/gpu:0'):
-    if args.optimizer == 'adam':
-        gen_optimizer = nn.adam_updates(gen_params, grads_gen, lr=tf_lr, mom1=args.momentum, mom2=0.99)
-        disc_optimizer = nn.adam_updates(disc_params, grads_disc, lr=tf_lr, mom1=args.momentum, mom2=0.99)
-    elif args.optimizer == 'adamax':
-        gen_optimizer = nn.adamax_updates(gen_params, grads_gen, lr=tf_lr, mom1=args.momentum, mom2=0.99)
-        disc_optimizer = nn.adamax_updates(disc_params, grads_disc, lr=tf_lr, mom1=args.momentum, mom2=0.99)
-    elif args.optimizer == 'nesterov':
-        gen_optimizer = nn.nesterov_updates(gen_params, grads_gen, lr=tf_lr, mom1=args.momentum)
-        disc_optimizer = nn.nesterov_updates(disc_params, grads_disc, lr=tf_lr, mom1=args.momentum)
-    else:
-        raise ('unsupported optimizer')
+opt = tf.train.AdamOptimizer(tf_lr, epsilon=1e-12, beta1=args.momentum, beta2=.99)
+opt = hvd.DistributedOptimizer(opt)
+gen_optimizer = opt.apply_gradients(zip(grads_gen,gen_params))
+disc_optimizer = opt.apply_gradients(zip(grads_disc,disc_params))
 
 # load CIFAR-10 data
 trainx, trainy = cifar10_data.load(args.data_dir + '/cifar-10-python')
 trainx = np.transpose(trainx, (0,2,3,1))/127.5 - 1.
-nr_batches_train_per_gpu = trainx.shape[0]//args.batch_size
 testx, testy = cifar10_data.load(args.data_dir + '/cifar-10-python', subset='test')
 testx = np.transpose(testx, (0,2,3,1))/127.5 - 1.
+trainx = np.concatenate([trainx,trainy],axis=0)
+trainx = trainx[hvd.rank()::hvd.size()]
+nr_batches_train_per_gpu = trainx.shape[0]//bs_per_gpu
 
+rng = np.random.RandomState(seed=hvd.rank()+args.seed)
+def maybe_flip(x):
+    x_out = np.zeros_like(x)
+    for i in range(x.shape[0]):
+        if rng.rand() < 0.5:
+            x_out[i] = x[i,:,::-1,:]
+        else:
+            x_out[i] = x[i]
+    return x_out
 
 # //////////// perform training //////////////
-try:
-    os.stat(args.save_dir)
-except:
-    os.mkdir(args.save_dir)
+if hvd.rank()==0:
+    try:
+        os.stat(args.save_dir)
+    except:
+        os.mkdir(args.save_dir)
 print('starting training')
 step_counter = 0
-
-test_batches_per_gpu = 50000 // args.batch_size + 1
+test_batches_per_gpu = 50000 // bs_per_gpu + 1
 max_inception_score = 0
 max_iter = 0
 current_epoch = 0
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
-    sess.run(init_ops, feed_dict={x_init: trainx[:bs_per_gpu]})
+    if hvd.rank()==0:
+        sess.run(init_ops, feed_dict={x_init: trainx[:bs_per_gpu]})
     if args.load_params:
-        saver.restore(sess, os.path.join(args.save_dir, args.model_name))
+        if hvd.rank() == 0:
+            saver.restore(sess, os.path.join(args.save_dir, args.model_name))
         ix = args.model_name.rfind('-')
         current_epoch = int(args.model_name[ix + 1:])
+    sess.run(hvd.broadcast_global_variables(0))
+    tf.get_default_graph().finalize()
 
     start_time = time.time()
     for epoch in range(current_epoch, args.nr_epochs):
         begin = time.time()
 
-        # randomly permute
         inds = np.random.permutation(trainx.shape[0])
         trainx = trainx[inds]
 
@@ -145,13 +139,10 @@ with tf.Session() as sess:
         np_distances = []
         np_entropies = [[] for i in range(6)]
         for t in range(nr_batches_train_per_gpu):
-            feed_dict = {}
-            for i in range(args.nr_gpu):
-                td = t + i * nr_batches_train_per_gpu
-                feed_dict[x_data[i]] = trainx[td * bs_per_gpu:(td + 1) * bs_per_gpu]
+            feed_dict = {x_data: trainx[t * bs_per_gpu:(t + 1) * bs_per_gpu]}
 
             # train discriminator once every args.nr_gen_per_disc batches
-            if epoch>10 and step_counter % (args.nr_gen_per_disc + 1) == 0:
+            if step_counter % (args.nr_gen_per_disc + 1) == 0:
                 feed_dict.update({tf_lr: args.learning_rate_disc})
                 npd, e, _ = sess.run([loss, entropies, disc_optimizer], feed_dict=feed_dict)
                 step_counter += 1
@@ -175,14 +166,12 @@ with tf.Session() as sess:
         print(log_str)
 
         # save generated image
-        sample_x = sess.run(x_gens)
-        sample_x = np.concatenate(sample_x)
+        sample_x = sess.run(x_gen)
         img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
         plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'sample%d.png' % epoch))
 
         # save EMA generated image
-        sample_x_ema = sess.run(x_gens_ema)
-        sample_x_ema = np.concatenate(sample_x_ema)
+        sample_x_ema = sess.run(x_gen_ema)
         img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
         plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
 
@@ -192,10 +181,8 @@ with tf.Session() as sess:
             sample_x = []
             sample_x_ema = []
             for t in range(test_batches_per_gpu):
-                sample_x_temp = sess.run(x_gens)
-                sample_x_temp = np.concatenate(sample_x_temp)
-                sample_x_ema_temp = sess.run(x_gens_ema)
-                sample_x_ema_temp = np.concatenate(sample_x_ema_temp)
+                sample_x_temp = sess.run(x_gen)
+                sample_x_ema_temp = sess.run(x_gen_ema)
                 sample_x.append(sample_x_temp)
                 sample_x_ema.append(sample_x_ema_temp)
             sample_x = np.concatenate(sample_x)

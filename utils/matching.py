@@ -28,17 +28,17 @@ def minibatch_energy_distance(features_a, features_b, sinkhorn_inv_lambda, nr_si
     assignments_transposed = {}
     entropies = {}
     summed_costs = {}
-    for k, C in costs:
+    for k, C in costs.items():
         log_a = -sinkhorn_inv_lambda * C
 
         for it in range(nr_sinkhorn_iter):
             # rows
-            log_a -= tf.reduce_logsumexp(log_a, axis=1, keep_dims=True)
+            log_a -= tf.reduce_logsumexp(log_a, axis=1, keepdims=True)
 
             # cols
-            log_sum_col = tf.reduce_logsumexp(log_a, axis=0, keep_dims=True)
+            log_sum_col = tf.reduce_logsumexp(log_a, axis=0, keepdims=True)
             all_log_sum_col = allgather(log_sum_col)
-            log_a -= tf.reduce_logsumexp(all_log_sum_col, axis=0, keep_dims=True)
+            log_a -= tf.reduce_logsumexp(all_log_sum_col, axis=0, keepdims=True)
 
         assignments[k] = tf.nn.softmax(log_a) # normalized rows
         assignments_transposed[k] = tf.exp(log_a) # normalized cols

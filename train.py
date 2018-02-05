@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import tensorflow as tf
 import horovod.tensorflow as hvd
+hvd.init()
 from utils import plotting
 from utils.matching import minibatch_energy_distance
 from utils.inception import get_inception_score

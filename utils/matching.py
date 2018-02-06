@@ -26,7 +26,7 @@ def minibatch_energy_distance(features_a, features_b, sinkhorn_inv_lambda, nr_si
     # use Sinkhorn algorithm to do soft assignment
     assignments = {}
     assignments_transposed = {}
-    entropies = {}
+    entropies = []
     summed_costs = {}
     for k, C in costs.items():
         log_a = -sinkhorn_inv_lambda * C
@@ -42,7 +42,7 @@ def minibatch_energy_distance(features_a, features_b, sinkhorn_inv_lambda, nr_si
 
         assignments[k] = tf.nn.softmax(log_a) # normalized rows
         assignments_transposed[k] = tf.exp(log_a) # normalized cols
-        entropies[k] = allreduce(tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=assignments[k], logits=log_a)), average=True)
+        entropies.append(allreduce(tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=assignments[k], logits=log_a)), average=True))
         summed_costs[k] = allreduce(tf.reduce_sum(assignments[k]*C), average=False)
 
     med_loss = 0.5 * (summed_costs['a1_b1'] + summed_costs['a1_b2'] + summed_costs['a2_b1'] + summed_costs['a2_b2']) \

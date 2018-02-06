@@ -5,9 +5,8 @@ import sys
 import numpy as np
 import tensorflow as tf
 import horovod.tensorflow as hvd
-hvd.init()
+import multiprocessing
 from utils import plotting
-from utils.matching import minibatch_energy_distance
 from utils.inception import get_inception_score
 from models.dcgan import generator, discriminator
 from data import cifar10_data
@@ -19,10 +18,10 @@ parser.add_argument('--batch_size', type=int, default=60000)
 parser.add_argument('--learning_rate_disc', type=float, default=0.0003)
 parser.add_argument('--learning_rate_gen', type=float, default=0.0003)
 parser.add_argument('--momentum', type=float, default=0.5)
-parser.add_argument('--data_dir', type=str, default='/root/data')
+parser.add_argument('--data_dir', type=str, default='/mnt/nfs/tim/data')
 parser.add_argument('--save_dir', type=str, default='/root/results/ot_gan')
 parser.add_argument('--nonlinearity', type=str, default='crelu')
-parser.add_argument('--nr_gen_per_disc', type=int, default=3, help='How many times to update the generator for each update of the discriminator?')
+parser.add_argument('--nr_gen_per_disc', type=int, default=1, help='How many times to update the generator for each update of the discriminator?')
 parser.add_argument('--nr_sinkhorn_iter', type=int, default=500)
 parser.add_argument('--sinkhorn_inv_lambda', type=float, default=500.)
 parser.add_argument('--load_params', dest='load_params', action='store_true')
@@ -30,7 +29,22 @@ parser.add_argument('--model_name', type=str, default='ot_gan_params-999')
 parser.add_argument('--nr_epochs', type=int, default=10000)
 args = parser.parse_args()
 print(args)
+
+hvd.init()
 bs_per_gpu = args.batch_size // hvd.size()
+assert bs_per_gpu%2 == 0 # 2 batches of samples
+tf.set_random_seed(args.seed + hvd.rank())
+np.random.seed(args.seed + hvd.rank())
+ncpu = multiprocessing.cpu_count()
+sess_config = tf.ConfigProto(allow_soft_placement=True,
+                        intra_op_parallelism_threads=ncpu,
+                        inter_op_parallelism_threads=ncpu)
+sess_config.gpu_options.allow_growth = True
+sess_config.gpu_options.visible_device_list = str(hvd.local_rank())
+sess = tf.Session(config=sess_config)
+sess.__enter__()
+
+from utils.matching import minibatch_energy_distance
 
 # extract model settings
 model_opts = {'batch_size': bs_per_gpu, 'nonlinearity': args.nonlinearity}
@@ -90,7 +104,7 @@ trainx, trainy = cifar10_data.load(args.data_dir + '/cifar-10-python')
 trainx = np.transpose(trainx, (0,2,3,1))/127.5 - 1.
 testx, testy = cifar10_data.load(args.data_dir + '/cifar-10-python', subset='test')
 testx = np.transpose(testx, (0,2,3,1))/127.5 - 1.
-trainx = np.concatenate([trainx,trainy],axis=0)
+trainx = np.concatenate([trainx,testx],axis=0)
 trainx = trainx[hvd.rank()::hvd.size()]
 nr_batches_train_per_gpu = trainx.shape[0]//bs_per_gpu
 
@@ -117,97 +131,98 @@ max_inception_score = 0
 max_iter = 0
 current_epoch = 0
 
-with tf.Session() as sess:
-    sess.run(tf.global_variables_initializer())
-    if hvd.rank()==0:
-        sess.run(init_ops, feed_dict={x_init: trainx[:bs_per_gpu]})
-    if args.load_params:
-        if hvd.rank() == 0:
-            saver.restore(sess, os.path.join(args.save_dir, args.model_name))
-        ix = args.model_name.rfind('-')
-        current_epoch = int(args.model_name[ix + 1:])
-    sess.run(hvd.broadcast_global_variables(0))
-    tf.get_default_graph().finalize()
+# run graph
+sess.run(tf.global_variables_initializer())
+if hvd.rank()==0:
+    sess.run(init_ops, feed_dict={x_init: trainx[:bs_per_gpu]})
+if args.load_params:
+    if hvd.rank() == 0:
+        saver.restore(sess, os.path.join(args.save_dir, args.model_name))
+    ix = args.model_name.rfind('-')
+    current_epoch = int(args.model_name[ix + 1:])
+sess.run(hvd.broadcast_global_variables(0))
+tf.get_default_graph().finalize()
 
-    start_time = time.time()
-    for epoch in range(current_epoch, args.nr_epochs):
-        begin = time.time()
+start_time = time.time()
+for epoch in range(current_epoch, args.nr_epochs):
+    begin = time.time()
 
-        inds = np.random.permutation(trainx.shape[0])
-        trainx = trainx[inds]
+    inds = np.random.permutation(trainx.shape[0])
+    trainx = trainx[inds]
 
-        # train
-        np_distances = []
-        np_entropies = [[] for i in range(6)]
-        for t in range(nr_batches_train_per_gpu):
-            feed_dict = {x_data: trainx[t * bs_per_gpu:(t + 1) * bs_per_gpu]}
+    # train
+    np_distances = []
+    np_entropies = [[] for i in range(6)]
+    for t in range(nr_batches_train_per_gpu):
+        feed_dict = {x_data: maybe_flip(trainx[t * bs_per_gpu:(t + 1) * bs_per_gpu])}
 
-            # train discriminator once every args.nr_gen_per_disc batches
-            if step_counter % (args.nr_gen_per_disc + 1) == 0:
-                feed_dict.update({tf_lr: args.learning_rate_disc})
-                npd, e, _ = sess.run([loss, entropies, disc_optimizer], feed_dict=feed_dict)
-                step_counter += 1
-                np_distances.append(npd)
-                for i in range(6):
-                    np_entropies[i].append(e[i])
+        # train discriminator once every args.nr_gen_per_disc batches
+        if epoch>1 and step_counter % (args.nr_gen_per_disc + 1) == 0:
+            feed_dict.update({tf_lr: args.learning_rate_disc})
+            npd, e, _ = sess.run([loss, entropies, disc_optimizer], feed_dict=feed_dict)
+            assert len(e) == 6
+            step_counter += 1
+            np_distances.append(npd)
+            for i in range(6):
+                np_entropies[i].append(e[i])
 
-            else:  # train generator
-                feed_dict.update({tf_lr: args.learning_rate_gen})
-                npd, e, _, _ = sess.run([loss, entropies, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
-                assert len(e) == 6
-                step_counter += 1
-                np_distances.append(npd)
-                for i in range(6):
-                    np_entropies[i].append(e[i])
+        else:  # train generator
+            feed_dict.update({tf_lr: args.learning_rate_gen})
+            npd, e, _, _ = sess.run([loss, entropies, gen_optimizer, maintain_averages_op], feed_dict=feed_dict)
+            assert len(e) == 6
+            step_counter += 1
+            np_distances.append(npd)
+            for i in range(6):
+                np_entropies[i].append(e[i])
 
-        # log
-        log_str = "Iteration %d, time = %ds, train distance = %.6f, entropies" % (epoch, time.time()-begin, np.mean(np_distances))
-        for el in np_entropies:
-            log_str += ' %.4f' % np.mean(el)
-        print(log_str)
+    # log
+    log_str = "Iteration %d, time = %ds, train distance = %.6f, entropies" % (epoch, time.time()-begin, np.mean(np_distances))
+    for el in np_entropies:
+        log_str += ' %.4f' % np.mean(el)
+    print(log_str)
 
-        # save generated image
-        sample_x = sess.run(x_gen)
-        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
-        plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'sample%d.png' % epoch))
+    # save generated image
+    sample_x = sess.run(x_gen)
+    img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
+    plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'sample%d.png' % epoch))
 
-        # save EMA generated image
-        sample_x_ema = sess.run(x_gen_ema)
-        img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
-        plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
+    # save EMA generated image
+    sample_x_ema = sess.run(x_gen_ema)
+    img_tile = plotting.img_tile(sample_x_ema[:100], aspect_ratio=1.0, border_color=1.0, stretch=False)
+    plotting.save_tile_img(img_tile, os.path.join(args.save_dir, 'ema_sample%d.png' % epoch))
 
-        # save parameters + historical distances
-        # calculate inception score
-        if (epoch + 1) % 100 == 0 and epoch != current_epoch:
-            sample_x = []
-            sample_x_ema = []
-            for t in range(test_batches_per_gpu):
-                sample_x_temp = sess.run(x_gen)
-                sample_x_ema_temp = sess.run(x_gen_ema)
-                sample_x.append(sample_x_temp)
-                sample_x_ema.append(sample_x_ema_temp)
-            sample_x = np.concatenate(sample_x)
-            sample_x_ema = np.concatenate(sample_x_ema)
+    # save parameters + historical distances
+    # calculate inception score
+    if (epoch + 1) % 100 == 0 and epoch != current_epoch:
+        sample_x = []
+        sample_x_ema = []
+        for t in range(test_batches_per_gpu):
+            sample_x_temp = sess.run(x_gen)
+            sample_x_ema_temp = sess.run(x_gen_ema)
+            sample_x.append(sample_x_temp)
+            sample_x_ema.append(sample_x_ema_temp)
+        sample_x = np.concatenate(sample_x)
+        sample_x_ema = np.concatenate(sample_x_ema)
 
-            sample_x = [127.5*(sample_x[i]+1.) for i in range(sample_x.shape[0])]
-            sample_x_ema = [127.5 * (sample_x_ema[i] + 1.) for i in range(sample_x_ema.shape[0])]
-            inception_score = get_inception_score(sample_x[:50000], splits=10)
-            print('inception score was %.6f, std was %.3f' % (inception_score[0], inception_score[1]))
-            if inception_score[0] > max_inception_score:
-                max_inception_score = inception_score[0]
-                max_iter = epoch
-            inception_score = get_inception_score(sample_x_ema[:50000], splits=10)
-            print('EMA inception score was %.6f, std was %.3f ' % (inception_score[0], inception_score[1]))
-            if inception_score[0] > max_inception_score:
-                max_inception_score = inception_score[0]
-                max_iter = epoch
-            print('max inception score was %.6f, iter was %d' % (max_inception_score, max_iter))
-            sys.stdout.flush()
+        sample_x = [127.5*(sample_x[i]+1.) for i in range(sample_x.shape[0])]
+        sample_x_ema = [127.5 * (sample_x_ema[i] + 1.) for i in range(sample_x_ema.shape[0])]
+        inception_score = get_inception_score(sample_x[:50000], splits=10)
+        print('inception score was %.6f, std was %.3f' % (inception_score[0], inception_score[1]))
+        if inception_score[0] > max_inception_score:
+            max_inception_score = inception_score[0]
+            max_iter = epoch
+        inception_score = get_inception_score(sample_x_ema[:50000], splits=10)
+        print('EMA inception score was %.6f, std was %.3f ' % (inception_score[0], inception_score[1]))
+        if inception_score[0] > max_inception_score:
+            max_inception_score = inception_score[0]
+            max_iter = epoch
+        print('max inception score was %.6f, iter was %d' % (max_inception_score, max_iter))
+        sys.stdout.flush()
 
-        if (epoch + 1) % 200 == 0 and epoch != current_epoch:
-            saver.save(sess, os.path.join(args.save_dir, 'ot_gan_params'), global_step=epoch)
-            print('current epoch %d, elapsed hours from start epoch %.3f, total updates %d' % (
-                epoch, (time.time()-start_time)/3600, step_counter
-            ))
-            sys.stdout.flush()
+    if (epoch + 1) % 200 == 0 and epoch != current_epoch:
+        saver.save(sess, os.path.join(args.save_dir, 'ot_gan_params'), global_step=epoch)
+        print('current epoch %d, elapsed hours from start epoch %.3f, total updates %d' % (
+            epoch, (time.time()-start_time)/3600, step_counter
+        ))
+        sys.stdout.flush()
 
